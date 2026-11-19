@@ -11,12 +11,13 @@ from unittest.mock import AsyncMock, patch
 
 from aiogram import Bot
 from aiogram.client.session.base import BaseSession
-from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
-from aiogram.methods import EditMessageCaption, EditMessageMedia, GetChatMember, SendDocument, SendMessage, SendPhoto, SendVideo
-from aiogram.methods import DeleteMessage
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter
+from aiogram.methods import EditMessageCaption, EditMessageMedia, GetChatMember, SendDocument, SendMessage, SendPhoto, SendVideo, SendMediaGroup
+from aiogram.methods import AnswerCallbackQuery, DeleteMessage, EditMessageText
 from aiogram.types import Update
 
 from bot import content, main
+from bot.season_download import SeasonDownloads
 from database import catalog, db
 
 
@@ -29,9 +30,26 @@ class LocalTelegram(BaseSession):
         self.post_failure_message = "Sinov xatosi"
         self.edit_failure = None
         self.failed_video = None
+        self.reject_album = False
+        self.throttle = 0
+        self.uncertain_video = None
+        self.latency = None
+        self.times = []
 
     async def make_request(self, bot, method, timeout=None):
         self.calls.append(method)
+        if isinstance(method, (SendVideo, SendDocument, SendMediaGroup)) and self.latency:
+            self.times.append(self.latency.time)
+            await self.latency.wait(0.15)
+        if isinstance(method, SendMediaGroup):
+            if self.throttle:
+                self.throttle -= 1
+                raise TelegramRetryAfter(method, "Sinov", 3)
+            if self.reject_album:
+                raise TelegramBadRequest(method=method, message="Sinov albomi rad etildi")
+            return [SimpleNamespace(message_id=len(self.calls)) for _ in method.media]
+        if isinstance(method, SendVideo) and method.video == self.uncertain_video:
+            raise TelegramNetworkError(method=method, message="Sinov tarmoq xatosi")
         if isinstance(method, GetChatMember):
             return SimpleNamespace(status="member" if method.user_id in self.members else "left")
         if isinstance(method, (SendMessage, SendPhoto, SendVideo)) and method.chat_id == main.CHANNEL and self.post_failure:
@@ -56,18 +74,35 @@ def form(code, kind="anime", title="Solo Leveling"):
                 release_year=2024, description="Sinov <&>")
 
 
+class VirtualClock:
+    def __init__(self):
+        self.time = 0.0
+
+    async def wait(self, seconds):
+        self.time += seconds
+        await asyncio.sleep(0)
+
+
 class AniVrumTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        self.enterContext(patch.dict(os.environ, {"DATABASE_URL": "", "ANIVRUM_REQUIRE_POSTGRES": ""}))
         fd, name = tempfile.mkstemp(suffix=".db", dir=Path(__file__).resolve().parent)
         os.close(fd)
         path = Path(name)
         self.addCleanup(path.unlink, missing_ok=True)
         self.enterContext(patch.object(db, "DB_PATH", path))
         self.enterContext(patch.object(main, "ADMIN_ID", 100))
+        self.clock = VirtualClock()
+        self.enterContext(patch.object(main, "season_downloads", SeasonDownloads(
+            clock=lambda: self.clock.time, wait=self.clock.wait,
+        )))
         self.session = LocalTelegram()
         self.bot = Bot("123456:local_test_token", session=self.session)
         self.update_id = 0
-        await main.dp.storage.close()
+        main.dp.storage.storage.clear()
+
+    async def finish_downloads(self):
+        await asyncio.gather(*main.season_downloads.jobs.values())
 
     def migrate(self):
         catalog.migrate()
@@ -109,7 +144,7 @@ class AniVrumTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(catalog.by_code("1001", "anime")["id"], 23)
         self.assertIsNone(catalog.content(23)["poster_file_id"])
         self.assertIsNone(catalog.content(23)["country"])
-        self.assertIn("Davlat:</b> Ko&#x27;rsatilmagan", content.caption(catalog.content(23)))
+        self.assertNotIn("Davlat:", content.caption(catalog.content(23)))
         self.assertEqual(db.get_episode_by_id(8)["media_type"], "video")
         self.assertTrue(db.is_favorite(11, 23))
         self.assertEqual(db.get_top_animes()[0]["views"], 1)
@@ -117,6 +152,25 @@ class AniVrumTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(tuple(conn.execute("SELECT * FROM anime_views").fetchone()),
                              (10, 23, 11, 8, "2025-03-01 00:00:00", 7))
             self.assertEqual(conn.execute("PRAGMA quick_check").fetchone()[0], "ok")
+
+    def test_button_styles_preserve_callbacks_and_default_navigation(self):
+        def styles(markup):
+            return {button.callback_data: button.style
+                    for row in markup.inline_keyboard for button in row}
+
+        self.assertTrue(all(style is None for style in styles(main.main_keyboard()).values()))
+        self.assertTrue(all(style is None for style in styles(main.anime_keyboard()).values()))
+        self.assertEqual(styles(content.admin_menu())["admin_add_anime"], "success")
+        self.assertEqual(styles(main.anime_manage_keyboard(23))["manage_delete_23"], "danger")
+        self.assertEqual(styles(main.anime_manage_keyboard(23))["p_admin_list_manage_0"], None)
+        self.assertEqual(styles(content.buttons((("✅ O‘chirish", "x_confirmvideo_7"),)))["x_confirmvideo_7"],
+                         "danger")
+        self.assertEqual(styles(content.buttons((("✅ Tasdiqlash", "p_admin_publish_23"),)))["p_admin_publish_23"],
+                         "success")
+        self.assertEqual(styles(content.buttons((("📥 Yuklash", "downloadall_23"),)))["downloadall_23"],
+                         "primary")
+        link = content.channel_keyboard({"id": 23}).inline_keyboard[0][0]
+        self.assertEqual((link.style, link.url), ("primary", "https://t.me/AniVrum_bot?start=animeid_23"))
 
     async def test_existing_v1_announcement_and_country_edit(self):
         with db.connection() as conn:
@@ -157,8 +211,8 @@ class AniVrumTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(message.photo, "old-poster")
             self.assertEqual(message.parse_mode, "HTML")
             self.assertIn(
-                "🎭 <b>Janr:</b> Kiritilmagan\n🌍 <b>Davlat:</b> Yaponiya, Xitoy\n"
-                "📅 <b>Yil:</b> —\n📺 <b>Fasllar:</b> 1 ta\n🎞 <b>Qismlar:</b> 1 ta\n"
+                "🌍 <b>Davlat:</b> Yaponiya, Xitoy\n"
+                "📺 <b>Fasllar:</b> 1 ta\n🎞 <b>Qismlar:</b> 1 ta\n"
                 "🔢 <b>Kod:</b> 3045", message.caption,
             )
 
@@ -270,8 +324,8 @@ class AniVrumTests(unittest.IsolatedAsyncioTestCase):
             db.add_episode_auto(season, "new-file-id", "document", "second")
         await content.publish(self.bot, main.CHANNEL, anime)
         self.session.failed_video = "bad"
-        with patch.object(asyncio, "sleep", new_callable=AsyncMock):
-            await self.update(11, data=f"downloadall_{season}")
+        await self.update(11, data=f"downloadall_{season}")
+        await self.finish_downloads()
         self.assertTrue(any(isinstance(call, SendDocument) and call.document == "ok"
                             for call in self.session.calls))
         self.assertEqual(db.get_top_animes()[0]["views"], 1)
@@ -533,8 +587,8 @@ class AniVrumTests(unittest.IsolatedAsyncioTestCase):
                 start = len(self.session.calls)
                 await self.update(user, text=f"/start animeid_{anime}")
                 await self.update(user, data=f"watchpart_{episode}")
-                with patch.object(asyncio, "sleep", new_callable=AsyncMock):
-                    await self.update(user, data=f"downloadall_{season}")
+                await self.update(user, data=f"downloadall_{season}")
+                await self.finish_downloads()
                 await self.update(user, data=f"episode_detail_{episode}")
                 messages = [method for method in self.session.calls[start:]
                             if isinstance(method, (SendDocument, SendPhoto, SendVideo))]
@@ -549,7 +603,7 @@ class AniVrumTests(unittest.IsolatedAsyncioTestCase):
         with db.connection() as conn:
             conn.execute("UPDATE animes SET visible=1 WHERE id=?", (movie,))
             conn.execute("INSERT INTO favorites(user_id, anime_id) VALUES (11, ?)", (movie,))
-            conn.execute("INSERT INTO announcements VALUES (?, 'sent', '-100', 12, 'movie-poster')", (movie,))
+            conn.execute("INSERT INTO announcements(anime_id,status,chat_id,message_id,poster_file_id) VALUES (?, 'sent', '-100', 12, 'movie-poster')", (movie,))
         anime = catalog.create_draft(form("2001", title="Anime Sarguzasht"), "poster", 1)
         db.add_episode_auto(db.get_anime_seasons(anime)[0]["id"], "episode")
         self.assertEqual(await content.publish(self.bot, main.CHANNEL, anime), "sent")
@@ -562,7 +616,7 @@ class AniVrumTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("AniVrum | Anime", message.text)
         self.assertEqual(
             [[button.callback_data for button in row] for row in message.reply_markup.inline_keyboard],
-            [["anime", "anime_search"], ["favorites", "top_animes"], ["about"]],
+            [["anime", "anime_search"], ["favorites", "top_animes"], ["x_news_0", "about"]],
         )
         await self.update(11, data="about")
         self.assertIn("AniVrum | Anime", self.session.calls[-2].text)
@@ -638,12 +692,13 @@ class AniVrumTests(unittest.IsolatedAsyncioTestCase):
         for field in ("YENGILMAS", "Janr:</b> Jangari, Fantastika", "Davlat:</b> AQSH",
                       "Yil:</b> 2024", "Fasllar:</b> 2 ta", "Qismlar:</b> 1 ta", "Sinov &lt;&amp;&gt;"):
             self.assertIn(field, page.caption)
-        actions = [row[0].callback_data for row in page.reply_markup.inline_keyboard[:3]]
-        self.assertEqual(actions, [f"choose_parts_{anime}", f"download_seasons_{anime}", f"p_fav_add_{anime}"])
+        actions = [row[0].callback_data for row in page.reply_markup.inline_keyboard[:4]]
+        self.assertEqual(actions, [f"choose_parts_{anime}", f"download_seasons_{anime}",
+                                   f"x_comment_{anime}", f"p_fav_add_{anime}"])
         for action in actions[:2]:
             await self.update(12, data=action)
             self.assertTrue(self.session.calls[-2].reply_markup.inline_keyboard[0])
-        await self.update(12, data=actions[2])
+        await self.update(12, data=actions[3])
         self.assertTrue(db.is_favorite(12, anime))
         await self.update(12, text="9999")
         self.assertEqual(self.session.calls[-1].text, "❌ Bu kod bo'yicha anime topilmadi")
@@ -721,6 +776,247 @@ class AniVrumTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(catalog.content(anime)["season_count"], 2)
         await self.update(11, text=f"/start animeid_{anime}")
         self.assertIn("Kod:</b> 2004", self.session.calls[-1].caption)
+
+
+    def seed_season(self, count):
+        anime = catalog.create_draft(form("1370"), None, 1)
+        season = db.get_anime_seasons(anime)[0]["id"]
+        with db.connection() as conn:
+            conn.execute("UPDATE animes SET visible=1 WHERE id=?", (anime,))
+            conn.executemany("INSERT INTO episodes(season_id,episode_number,video_file_id) VALUES (?,?,?)",
+                             ((season, n, f"v{n}") for n in range(count, 0, -1)))
+        return anime, season
+
+    def delivered(self, user):
+        found = []
+        for call in self.session.calls:
+            if getattr(call, "chat_id", None) != user:
+                continue
+            if isinstance(call, SendMediaGroup):
+                found.extend((media.media, media.caption, call.protect_content) for media in call.media)
+            elif isinstance(call, SendVideo):
+                found.append((call.video, call.caption, call.protect_content))
+        return found
+
+    async def test_season_5_25_100_500_order_policy_and_latency(self):
+        self.migrate()
+        anime, season = self.seed_season(500)
+        self.session.latency = self.clock
+        for count in (5, 25, 100, 500):
+            with self.subTest(count=count):
+                episodes = db.get_season_episodes(season)[:count]
+                self.session.calls.clear()
+                self.session.times.clear()
+                start = self.clock.time
+                with patch.object(main, "get_season_episodes", return_value=episodes[::-1]):
+                    await self.update(11, data=f"downloadall_{season}")
+                    await self.finish_downloads()
+                sent = self.delivered(11)
+                self.assertEqual([v[0] for v in sent], [f"v{i}" for i in range(1, count+1)])
+                for index, (_, caption, protected) in enumerate(sent, 1):
+                    self.assertTrue(protected)
+                    self.assertEqual(caption, f"Solo Leveling\n📺 1-fasl\n🎬 {index}-qism")
+                self.assertEqual(len(self.session.times), (count+1)//2)
+                for left, right in zip(self.session.times, self.session.times[1:]):
+                    self.assertGreaterEqual(right-left, 2 - 1e-8)
+                summary = [call.text for call in self.session.calls if isinstance(call, EditMessageText)][-1]
+                self.assertIn(f"{count}/{count} ta qism", summary)
+                old = (count-1)*1.1 + count*0.15
+                new = self.session.times[-1] + 0.15 - start
+                print(f"{count} episodes: old {old:.2f}s, new {new:.2f}s through last video")
+                self.assertLessEqual(round(new, 2), round(old, 2))
+        self.assertEqual(catalog.content(anime)["views"], 630)
+
+    async def test_concurrent_seasons_and_duplicate_callbacks(self):
+        self.migrate()
+        _, season = self.seed_season(25)
+        entered, resume = asyncio.Event(), asyncio.Event()
+        send = self.session.make_request
+
+        async def pause_first_user(bot, method, timeout=None):
+            if isinstance(method, SendMediaGroup) and method.chat_id == 11 and not entered.is_set():
+                entered.set()
+                await resume.wait()
+            return await send(bot, method, timeout)
+
+        with patch.object(self.session, "make_request", side_effect=pause_first_user):
+            await self.update(11, data=f"downloadall_{season}")
+            await asyncio.wait_for(entered.wait(), 5)
+            await self.update(11, data=f"downloadall_{season}")
+            self.assertTrue(any(isinstance(call, AnswerCallbackQuery) and "kut" in (call.text or "")
+                                for call in self.session.calls))
+            await self.update(100, data=f"downloadall_{season}")
+            await asyncio.wait_for(main.season_downloads.jobs[100], 5)
+            self.assertEqual(len(self.delivered(100)), 25)
+            self.assertFalse(any(row[2] for row in self.delivered(100)))
+            await self.update(11, data="about")
+            self.assertEqual(len(self.delivered(11)), 0)
+            resume.set()
+            await self.finish_downloads()
+        self.assertEqual([row[0] for row in self.delivered(11)], [f"v{i}" for i in range(1,26)])
+
+    async def test_album_retry_fallback_rejection_and_uncertain_failure(self):
+        self.migrate()
+        anime, season = self.seed_season(5)
+        self.session.latency = self.clock
+        self.session.throttle = 1
+        self.session.reject_album = True
+        self.session.failed_video = "v2"
+        self.session.uncertain_video = "v4"
+        await self.update(11, data=f"downloadall_{season}")
+        await self.finish_downloads()
+        self.assertGreaterEqual(self.session.times[1] - self.session.times[0], 3)
+        attempts = [call for call in self.session.calls if isinstance(call, SendMediaGroup)]
+        self.assertEqual([item.media for item in attempts[0].media], ["v1", "v2"])
+        self.assertEqual([item.media for item in attempts[1].media], ["v1", "v2"])
+        self.assertTrue(all(call.protect_content for call in attempts))
+        self.assertEqual([call.video for call in self.session.calls if isinstance(call, SendVideo)],
+                         ["v1", "v2", "v3", "v4"])
+        summary = [call.text for call in self.session.calls if isinstance(call, EditMessageText)][-1]
+        self.assertIn("2/5", summary)
+        self.assertIn("4-qismda", summary)
+        self.assertIn("qismlar (1 ta): 2", summary)
+        self.assertEqual(catalog.content(anime)["views"], 2)
+
+    async def test_season_caption_modes_and_links(self):
+        self.migrate()
+        anime, season = self.seed_season(2)
+        for mode, text, link, expected in (
+            ("custom", "Maxsus <&>", "channel", "Solo Leveling\n📺 1-fasl\n🎬 1-qism\n\nMaxsus <&>\n\n📢 @AniVrum"),
+            ("auto", None, "bot", "Solo Leveling\n📺 1-fasl\n🎬 1-qism\n\nhttps://t.me/AniVrum_bot"),
+            ("none", None, "channel", None),
+        ):
+            with self.subTest(mode=mode):
+                await self.update(100, data=f"x_caption_{anime}")
+                await self.update(100, text=f"{mode}\n{link}" + (f"\n{text}" if text else ""))
+                self.session.calls.clear()
+                await self.update(11, data=f"downloadall_{season}")
+                await self.finish_downloads()
+                self.assertEqual(self.delivered(11)[0][1], expected)
+
+    async def test_second_flood_response_switches_to_single_videos(self):
+        self.migrate()
+        _, season = self.seed_season(5)
+        self.session.latency = self.clock
+        self.session.throttle = 2
+        await self.update(11, data=f"downloadall_{season}")
+        await self.finish_downloads()
+        self.assertEqual(sum(isinstance(call, SendMediaGroup) for call in self.session.calls), 2)
+        self.assertGreaterEqual(self.session.times[2] - self.session.times[1], 3)
+        self.assertEqual([call.video for call in self.session.calls if isinstance(call, SendVideo)],
+                         ["v1", "v2", "v3", "v4", "v5"])
+
+    def test_statistics_retention_removes_expired_records(self):
+        self.migrate()
+        anime, season = self.seed_season(1)
+        with db.connection() as conn:
+            conn.execute("INSERT INTO bot_users VALUES (11,'2000-01-01')")
+            conn.execute("INSERT INTO bot_metrics VALUES ('2000-01-01','search',0,3)")
+            conn.execute("""INSERT INTO anime_views(anime_id,user_id,episode_id,season_id,viewed_at)
+                VALUES (?,11,1,?,'2000-01-01')""", (anime, season))
+        with patch.dict(os.environ, {"STATISTICS_RETENTION_DAYS": "7"}):
+            users, metrics, _, _ = catalog.owner_statistics()
+        self.assertEqual(tuple(users), (0, 0))
+        self.assertNotIn("search", metrics)
+        self.assertEqual(catalog.content(anime)["views"], 0)
+
+
+    async def test_standalone_creation_edit_deletion_and_catalog(self):
+        self.migrate()
+        video = {"file_id": "film-id", "file_unique_id": "unique", "width": 1, "height": 1, "duration": 1}
+        for code, kind in (("1311", "film"), ("1312", "ova")):
+            await self.update(100, data="admin_add_anime")
+            await self.update(100, data=f"x_kind_{kind}")
+            for value in (f"Anime {kind}", code, "/skip", "/skip", "/skip", "/skip", "/skip"):
+                await self.update(100, text=value)
+            with db.connection() as conn:
+                anime = conn.execute("SELECT id FROM animes WHERE code=?", (code,)).fetchone()[0]
+            await self.update(100, data=f"x_add_{kind}_{anime}")
+            await self.update(100, text=f"1\nMustaqil {kind}")
+            await self.update(100, text="/skip")
+            await self.update(100, video=video)
+            entry, = catalog.standalone_videos(anime)
+            self.assertEqual(await content.publish(self.bot, main.CHANNEL, anime), "sent")
+            self.assertTrue(catalog.announcement(anime)["is_text"])
+            self.assertEqual(db.get_anime_seasons(anime), [])
+            self.assertEqual(db.search_animes(f"Mustaqil {kind}")[0]["id"], anime)
+            await self.update(11, text=f"/start animeid_{anime}")
+            page = self.session.calls[-1]
+            actions = [button.callback_data for row in page.reply_markup.inline_keyboard for button in row]
+            self.assertIn(f"x_video_{entry['id']}", actions)
+            self.assertNotIn(f"download_seasons_{anime}", actions)
+            self.assertNotIn("Davlat:", page.text)
+            await self.update(11, data=f"x_video_{entry['id']}")
+            self.assertTrue(self.delivered(11)[-1][2])
+            self.assertIn(f"Mustaqil {kind}", self.delivered(11)[-1][1])
+        db.add_season(anime, 1)
+        for kind, number in (("film", 1), ("film", 2), ("ova", 2)):
+            catalog.save_video(anime, kind, number, f"{kind}-{number}", None, "other", "video")
+        self.assertEqual(len(catalog.standalone_videos(anime)), 4)
+        await self.update(11, text=f"/start animeid_{anime}")
+        actions = [button.callback_data for row in self.session.calls[-1].reply_markup.inline_keyboard for button in row]
+        self.assertIn(f"download_seasons_{anime}", actions)
+        self.assertEqual(sum(action.startswith("x_video_") for action in actions), 4)
+        await self.update(100, data=f"x_editvideo_{entry['id']}")
+        await self.update(100, text="3\nYangi nom\nTavsif")
+        await self.update(100, text="2025\nYaponiya\nSarguzasht")
+        await self.update(100, video={**video, "file_id": "replacement"})
+        updated = catalog.standalone_video(entry["id"])
+        self.assertEqual((updated["number"], updated["title"], updated["file_id"], updated["release_year"]),
+                         (3, "Yangi nom", "replacement", 2025))
+        await self.update(100, data=f"x_deletevideo_{entry['id']}")
+        self.assertIsNotNone(catalog.standalone_video(entry["id"]))
+        await self.update(100, data=f"x_confirmvideo_{entry['id']}")
+        self.assertIsNone(catalog.standalone_video(entry["id"]))
+        self.assertEqual(len(catalog.standalone_videos(anime)), 3)
+        self.assertEqual(len(db.get_anime_seasons(anime)), 1)
+
+    async def test_news_comment_moderation_and_owner_statistics(self):
+        self.migrate()
+        anime, _ = self.seed_season(2)
+        await self.update(11, data="x_news_0")
+        self.assertIn("yangiliklar yo‘q", self.session.calls[-1].text)
+        await self.update(100, data="x_newnews_0")
+        await self.update(100, text="anime\n1370\nSarlavha\nMatn")
+        await self.update(100, photo=[{"file_id": "news-photo", "file_unique_id": "news-unique", "width": 1, "height": 1}])
+        entry, = catalog.news()
+        self.assertEqual(entry["anime_id"], anime)
+        await self.update(100, data=f"x_newnews_{entry['id']}")
+        await self.update(100, text="ova\n-\nYangilangan\nYangi matn")
+        await self.update(100, text="/keep")
+        await self.update(11, data=f"x_readnews_{entry['id']}")
+        self.assertIn("Yangilangan", self.session.calls[-1].caption)
+        self.assertEqual(self.session.calls[-1].photo, "news-photo")
+        await self.update(100, data=f"x_asknews_{entry['id']}")
+        self.assertIsNone(catalog.news(entry["id"])["published_at"])
+        await self.update(100, data=f"x_postnews_{entry['id']}")
+        await self.update(100, data=f"x_postnews_{entry['id']}")
+        self.assertEqual(sum(isinstance(call, SendPhoto) and call.chat_id == main.CHANNEL
+                             for call in self.session.calls), 1)
+        await self.update(100, data=f"x_delnews_{entry['id']}")
+        await self.update(100, data=f"x_dropnews_{entry['id']}")
+        self.assertEqual(catalog.news(), [])
+        with patch.dict(os.environ, {"COMMENT_MODERATION_CHAT_ID": "-100399"}):
+            await self.update(11, data=f"x_comment_{anime}")
+            self.assertIn("administrator", self.session.calls[-1].text)
+            await self.update(11, text="Sinov izohi")
+            await self.update(11, data=f"x_comment_{anime}")
+            await self.update(11, text="Spam")
+        comment, = catalog.comments()
+        self.assertEqual((comment["anime_code"], comment["body"]), ("1370", "Sinov izohi"))
+        self.assertTrue(any(isinstance(call, SendMessage) and str(call.chat_id) == "-100399"
+                            and "Sinov izohi" in call.text for call in self.session.calls))
+        await self.update(100, data=f"x_viewcomment_{comment['id']}")
+        self.assertIn("Sinov izohi", self.session.calls[-1].text)
+        await self.update(100, data=f"x_dropcomment_{comment['id']}")
+        self.assertEqual(catalog.comments(), [])
+        await self.update(11, data="x_stats")
+        self.assertTrue(self.session.calls[-1].show_alert)
+        catalog.metric("search")
+        catalog.metric("error")
+        await self.update(100, data="x_stats")
+        for value in ("Jami foydalanuvchilar: 2", "Qidiruvlar: 1", "Xatolar: 1"):
+            self.assertIn(value, self.session.calls[-1].text)
 
 
 if __name__ == "__main__":

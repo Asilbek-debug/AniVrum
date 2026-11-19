@@ -12,6 +12,22 @@ from database import db
 
 
 class RenderWebTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.enterContext(patch.dict(os.environ, {"DATABASE_URL": "", "ANIVRUM_REQUIRE_POSTGRES": ""}))
+
+    async def test_render_passes_postgres_configuration_only_when_polling_enabled(self):
+        with patch.dict(os.environ, {
+            "ENABLE_BOT": "false", "DATABASE_URL": "postgresql://unused.invalid/test", "ANIVRUM_DB_PATH": "",
+        }), patch.object(main, "main", new_callable=AsyncMock) as bot_main:
+            async with TestClient(TestServer(web.create_app())) as client:
+                self.assertFalse((await (await client.get("/healthz")).json())["polling_enabled"])
+            bot_main.assert_not_called()
+            await web.run_polling()
+            bot_main.assert_awaited_once_with(load_local_env=False, handle_signals=False)
+            bot_main.reset_mock()
+            with patch.dict(os.environ, {"ANIVRUM_DB_PATH": "sqlite-test.db"}):
+                await web.run_polling()
+            bot_main.assert_not_called()
     async def test_health_runs_without_polling_by_default(self):
         with patch.dict(os.environ, {"ENABLE_BOT": ""}), patch.object(
             web, "run_polling", new_callable=AsyncMock
@@ -49,7 +65,7 @@ class RenderWebTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue((await response.json())["polling_enabled"])
                 self.assertEqual(db.DB_PATH, path)
                 with db.connection() as conn:
-                    self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 3)
+                    self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 4)
             dotenv.assert_not_called()
             self.assertIs(started_polling.call_args.kwargs["handle_signals"], False)
 

@@ -2,7 +2,6 @@
 import asyncio
 import os
 import logging
-import sqlite3
 from pathlib import Path
 
 
@@ -49,7 +48,7 @@ from database.db import (
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command, StateFilter
-from aiogram.types import Message, CallbackQuery, InlineKeyboardButton
+from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.utils.token import TokenValidationError
 from dotenv import load_dotenv
@@ -57,7 +56,8 @@ from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import CommandObject
 from database import catalog as store
 from database import db
-from bot import content
+from bot import content, extras
+from bot.season_download import SeasonDownloads
 
 log = logging.getLogger(__name__)
 
@@ -104,6 +104,7 @@ class SearchAnime(StatesGroup):
 
 
 dp = Dispatcher(events_isolation=SimpleEventIsolation())
+season_downloads = SeasonDownloads()
 
 
 # Telegram ID raqamini ko'rsatish
@@ -139,11 +140,11 @@ async def cancel_form(message: Message, state: FSMContext):
 
 def subscription_keyboard(anime_id=None):
     keyboard = InlineKeyboardBuilder()
-    keyboard.button(text="Kanalga obuna bo‘lish", url="https://t.me/AniVrum")
-    keyboard.button(
-        text="Obunani tekshirish",
+    keyboard.add(content.button(text="🔗 Kanalga obuna bo‘lish", url="https://t.me/AniVrum"))
+    keyboard.add(content.button(
+        text="✅ Obunani tekshirish",
         callback_data=f"check_subscription_{anime_id}" if anime_id else "check_subscription",
-    )
+    ))
     keyboard.adjust(1)
     return keyboard.as_markup()
 
@@ -156,32 +157,35 @@ def subscription_keyboard(anime_id=None):
 def main_keyboard():
     keyboard = InlineKeyboardBuilder()
 
-    keyboard.button(
+    keyboard.add(content.button(
         text="🎌 Animelar",
         callback_data="anime"
-    )
+    ))
 
-    keyboard.button(
+    keyboard.add(content.button(
         text="🔎 Qidiruv",
         callback_data="anime_search"
-    )
+    ))
 
-    keyboard.button(
+    keyboard.add(content.button(
         text="⭐ Sevimlilar",
         callback_data="favorites"
-    )
+    ))
 
-    keyboard.button(
+    keyboard.add(content.button(
         text="🔥 TOP animelar",
         callback_data="top_animes"
-    )
+    ))
 
-    keyboard.button(
+    keyboard.add(content.button(
+        text="📰 Anime yangiliklari", callback_data="x_news_0"
+    ))
+    keyboard.add(content.button(
         text="ℹ️ Bot haqida",
         callback_data="about"
-    )
+    ))
 
-    keyboard.adjust(2, 2, 1)
+    keyboard.adjust(2, 2, 2)
 
     return keyboard.as_markup()
 
@@ -190,27 +194,27 @@ def main_keyboard():
 def anime_keyboard():
     keyboard = InlineKeyboardBuilder()
 
-    keyboard.button(
+    keyboard.add(content.button(
         text="🔤 Alifbo bo‘yicha",
         callback_data="anime_az"
-    )
-    keyboard.button(
+    ))
+    keyboard.add(content.button(
         text="🆕 Yangi qo‘shilganlar",
         callback_data="anime_new"
-    )
-    keyboard.button(
+    ))
+    keyboard.add(content.button(
         text="🔥 Mashhur animelar",
         callback_data="anime_popular"
-    )
-    keyboard.button(
+    ))
+    keyboard.add(content.button(
         text="🎭 Janrlar",
         callback_data="anime_genres"
-    )
-    keyboard.button(text="📅 Yillar", callback_data="anime_years")
-    keyboard.button(
+    ))
+    keyboard.add(content.button(text="📅 Yillar", callback_data="anime_years"))
+    keyboard.add(content.button(
         text="⬅️ Asosiy menyu",
         callback_data="back_home"
-    )
+    ))
 
     keyboard.adjust(2, 2, 1, 1)
     return keyboard.as_markup()
@@ -316,17 +320,17 @@ async def show_anime_seasons(callback: CallbackQuery, bot: Bot):
         text = f"📺 {anime['title']} — Fasllar\n\n👇 Faslni tanlang:"
 
         for season in seasons:
-            keyboard.button(
+            keyboard.add(content.button(
                 text=f"📺 {season['season_number']}-fasl",
                 callback_data=f"season_detail_{season['id']}"
-            )
+            ))
     else:
         text = "📭 Bu anime uchun hali fasllar qo'shilmagan."
 
-    keyboard.button(
+    keyboard.add(content.button(
         text="⬅️ Anime ma'lumotlari",
         callback_data=f"anime_detail_{anime_id}"
-    )
+    ))
 
     keyboard.adjust(1)
 
@@ -365,18 +369,18 @@ async def show_season_episodes(callback: CallbackQuery, bot: Bot):
         text = "📺 Fasldagi qismlar\n\n👇 Qismni tanlang:"
 
         for episode in episodes:
-            keyboard.button(
+            keyboard.add(content.button(
                 text=f"▶️ {episode['episode_number']}-qism",
                 callback_data=f"episode_detail_{episode['id']}"
-            )
+            ))
     else:
         text = "📭 Bu faslda hali qismlar mavjud emas."
 
 
-    keyboard.button(
+    keyboard.add(content.button(
         text="⬅️ Fasllarga qaytish",
         callback_data=f"anime_seasons_{anime_id}"
-    )
+    ))
 
     keyboard.adjust(1)
 
@@ -416,7 +420,10 @@ async def admin_add_anime(callback: CallbackQuery, state: FSMContext):
 
     await callback.message.answer(
         "🎬 Yangi anime qo'shish\n\n"
-        "✍️ Anime nomini yuboring:"
+        "✍️ Anime nomini yuboring yoki kontent turini tanlang:",
+        reply_markup=content.buttons((("📺 Anime serial", "x_kind_anime"),
+                                      ("🎞 Anime filmi", "x_kind_film"),
+                                      ("⭐ OVA", "x_kind_ova")))
     )
 
     await callback.answer()
@@ -474,6 +481,11 @@ async def receive_anime_code(message: Message, state: FSMContext):
 async def receive_anime_genre(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
+    if message.text == "/skip":
+        await state.update_data(genre=None)
+        await state.set_state(AddAnime.country)
+        await message.answer("🌍 Davlatini kiriting yoki /skip yuboring.")
+        return
 
     if not message.text or not message.text.strip():
         await message.answer("❗ Anime janrini matn shaklida yuboring.")
@@ -483,12 +495,17 @@ async def receive_anime_genre(message: Message, state: FSMContext):
 
     await state.update_data(genre=genre)
     await state.set_state(AddAnime.country)
-    await message.answer("🌍 Davlatini kiriting. Masalan: Yaponiya, Xitoy")
+    await message.answer("🌍 Davlatini kiriting yoki /skip yuboring. Masalan: Yaponiya, Xitoy")
 
 
 @dp.message(AddAnime.country)
 async def receive_anime_country(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
+        return
+    if message.text == "/skip":
+        await state.update_data(country=None)
+        await state.set_state(AddAnime.release_year)
+        await message.answer("📅 Yilni kiriting yoki /skip yuboring.")
         return
     country = content.normalize_country(message.text)
     if country is None:
@@ -496,13 +513,18 @@ async def receive_anime_country(message: Message, state: FSMContext):
         return
     await state.update_data(country=country)
     await state.set_state(AddAnime.release_year)
-    await message.answer("📅 Chiqarilgan yilini yuboring. Masalan: 2025")
+    await message.answer("📅 Chiqarilgan yilini yuboring yoki /skip yozing. Masalan: 2025")
 
 
 # Anime yilini qabul qilish
 @dp.message(AddAnime.release_year)
 async def receive_anime_year(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
+        return
+    if message.text == "/skip":
+        await state.update_data(release_year=None)
+        await state.set_state(AddAnime.description)
+        await message.answer("📝 Tavsif kiriting yoki /skip yuboring.")
         return
 
     if not message.text or not content.numeric_id(message.text.strip()):
@@ -533,22 +555,27 @@ async def receive_anime_description(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
     description = (message.text or "").strip()
+    if description == "/skip":
+        await state.update_data(description=None)
+        await state.set_state(content.ContentForm.poster)
+        await message.answer("Poster rasmini yuboring yoki /skip yuboring.")
+        return
     if not description or len(description) > 2500:
         await message.answer("Tavsifni 1–2500 belgi oralig‘ida kiriting.")
         return
     await state.update_data(description=description)
     await state.set_state(content.ContentForm.poster)
-    await message.answer("Posterni rasm shaklida yuboring.")
+    await message.answer("Posterni rasm shaklida yuboring yoki /skip yozing.")
 
 
 def admin_anime_keyboard(action):
     keyboard = InlineKeyboardBuilder()
 
     for anime in get_all_animes():
-        keyboard.button(
+        keyboard.add(content.button(
             text=f"🎬 {anime['title']}",
             callback_data=f"{action}_{anime['id']}"
-        )
+        ))
 
     keyboard.adjust(1)
     return keyboard.as_markup()
@@ -665,10 +692,10 @@ async def admin_choose_season_for_upload(callback: CallbackQuery):
     keyboard = InlineKeyboardBuilder()
 
     for season in seasons:
-        keyboard.button(
+        keyboard.add(content.button(
             text=f"📺 {season['season_number']}-fasl",
             callback_data=f"uploadseason_{season['id']}"
-        )
+        ))
 
     keyboard.adjust(1)
 
@@ -763,10 +790,10 @@ async def admin_receive_video(message: Message, state: FSMContext):
             season_id,
             media.file_id, media_type, media.file_unique_id
         )
-    except sqlite3.IntegrityError:
+    except db.INTEGRITY_ERRORS:
         await message.answer("Bu video ushbu faslda allaqachon mavjud.")
         return
-    except sqlite3.Error:
+    except db.DATABASE_ERRORS:
         log.warning("Qismni saqlashda SQLite xatosi.")
         await message.answer("❌ Videoni saqlab bo'lmadi.")
         return
@@ -816,15 +843,15 @@ async def choose_parts_season(callback: CallbackQuery, bot: Bot):
     keyboard = InlineKeyboardBuilder()
 
     for season in seasons:
-        keyboard.button(
+        keyboard.add(content.button(
             text=f"📺 {season['season_number']}-fasl",
             callback_data=f"numbered_parts_{season['id']}"
-        )
+        ))
 
     keyboard.adjust(2)
 
     keyboard.row(
-        InlineKeyboardButton(
+        content.button(
             text="⬅️ Anime sahifasiga qaytish",
             callback_data=f"anime_detail_{anime_id}"
         )
@@ -863,15 +890,15 @@ async def numbered_parts(callback: CallbackQuery, bot: Bot):
     keyboard = InlineKeyboardBuilder()
 
     for episode in available:
-        keyboard.button(
+        keyboard.add(content.button(
             text=str(episode["episode_number"]),
             callback_data=f"watchpart_{episode['id']}"
-        )
+        ))
 
     keyboard.adjust(4)
 
     keyboard.row(
-        InlineKeyboardButton(
+        content.button(
             text="⬅️ Fasllarga qaytish",
             callback_data=f"choose_parts_{season['anime_id']}"
         )
@@ -936,11 +963,12 @@ async def deliver_episode(bot, callback, episode):
             protect_content=callback.from_user.id != ADMIN_ID,
         )
     except TelegramAPIError:
+        extras.track("error")
         log.warning("Qism yuborilmadi. Qism ID: %s", episode["id"])
         return False
     try:
         add_anime_view(item["id"], callback.from_user.id, episode["id"], season["id"])
-    except sqlite3.Error:
+    except db.DATABASE_ERRORS:
         log.warning("Yuborish statistikasini saqlab bo‘lmadi. Qism ID: %s", episode["id"])
     return True
 
@@ -963,15 +991,15 @@ async def choose_download_season(callback: CallbackQuery, bot: Bot):
     keyboard = InlineKeyboardBuilder()
 
     for season in seasons:
-        keyboard.button(
+        keyboard.add(content.button(
             text=f"📥 {season['season_number']}-fasl",
             callback_data=f"downloadall_{season['id']}"
-        )
+        ))
 
     keyboard.adjust(2)
 
     keyboard.row(
-        InlineKeyboardButton(
+        content.button(
             text="⬅️ Anime sahifasiga qaytish",
             callback_data=f"anime_detail_{anime_id}"
         )
@@ -1032,16 +1060,34 @@ async def download_entire_season(callback: CallbackQuery, bot: Bot):
         )
         return
 
-    await callback.answer()
+    user_id = callback.from_user.id
+    if not isinstance(callback.message, Message) or callback.message.chat.type != "private":
+        await callback.answer("Faslni botning shaxsiy chatida yuklang.", show_alert=True)
+        return
+    jobs = season_downloads.jobs
+    if user_id in jobs:
+        await callback.answer("Fasl yuborilmoqda. Iltimos, tugashini kuting.", show_alert=True)
+        return
+    if len(jobs) >= 32:
+        await callback.answer("Yuklash navbati band. Keyinroq urinib ko?ring.", show_alert=True)
+        return
+    jobs[user_id] = asyncio.create_task(run_season_download(
+        callback, bot, item, season, available
+    ))
+    await callback.answer("Yuborish boshlandi.")
 
-    failed = 0
-    for index, episode in enumerate(available):
-        if index:
-            await asyncio.sleep(1.1)
-        if not await deliver_episode(bot, callback, episode):
-            failed += 1
-    if failed:
-        await callback.message.answer(f"{failed} ta qismni yuborib bo‘lmadi.")
+
+async def run_season_download(callback, bot, item, season, episodes):
+    user_id = callback.from_user.id
+    try:
+        await season_downloads.deliver(
+            bot, callback.message, user_id, item, season, episodes, user_id != ADMIN_ID
+        )
+    except TelegramAPIError as error:
+        extras.track("error")
+        log.warning("Fasl %s: %s", season["id"], type(error).__name__)
+    finally:
+        season_downloads.jobs.pop(user_id, None)
 
 
 def anime_manage_keyboard(anime_id):
@@ -1057,28 +1103,28 @@ def anime_manage_keyboard(anime_id):
     ]
 
     for label, field in fields:
-        keyboard.button(
+        keyboard.add(content.button(
             text=label,
             callback_data=f"manage_edit_{field}_{anime_id}"
-        )
+        ))
 
     keyboard.adjust(2)
 
-    keyboard.row(InlineKeyboardButton(text="📺 Fasllarni boshqarish", callback_data=f"manage_seasons_{anime_id}"))
+    keyboard.row(content.button(text="📺 Fasllarni boshqarish", callback_data=f"manage_seasons_{anime_id}"))
     keyboard.row(
-        InlineKeyboardButton(text="🖼 Poster", callback_data=f"p_admin_poster_{anime_id}"),
-        InlineKeyboardButton(text="📢 E’lon", callback_data=f"p_admin_post_{anime_id}"),
+        content.button(text="🖼 Poster", callback_data=f"p_admin_poster_{anime_id}"),
+        content.button(text="📢 E’lon", callback_data=f"p_admin_post_{anime_id}"),
     )
 
     keyboard.row(
-        InlineKeyboardButton(
+        content.button(
             text="🗑 Animeni o'chirish",
             callback_data=f"manage_delete_{anime_id}"
         )
     )
 
     keyboard.row(
-        InlineKeyboardButton(
+        content.button(
             text="⬅️ Animelar ro'yxati",
             callback_data="p_admin_list_manage_0"
         )
@@ -1098,10 +1144,10 @@ async def admin_manage_animes(callback: CallbackQuery):
     keyboard = InlineKeyboardBuilder()
 
     for anime in animes:
-        keyboard.button(
+        keyboard.add(content.button(
             text=f"🎬 {anime['title']}",
             callback_data=f"manage_anime_{anime['id']}"
-        )
+        ))
 
     keyboard.adjust(1)
 
@@ -1244,7 +1290,7 @@ async def manage_save_anime_edit(message: Message, state: FSMContext):
             await message.answer("❌ Noma'lum maydon.")
             return
 
-    except sqlite3.IntegrityError:
+    except db.INTEGRITY_ERRORS:
         await message.answer(
             "❌ Bu anime kodi allaqachon ishlatilgan.\n"
             "Boshqa kod yuboring."
@@ -1259,10 +1305,10 @@ async def manage_save_anime_edit(message: Message, state: FSMContext):
     await state.clear()
 
     keyboard = InlineKeyboardBuilder()
-    keyboard.button(
+    keyboard.add(content.button(
         text="⬅️ Anime boshqaruviga qaytish",
         callback_data=f"manage_anime_{anime_id}"
-    )
+    ))
 
     await message.answer(
         "✅ Anime ma'lumoti muvaffaqiyatli yangilandi!",
@@ -1285,14 +1331,14 @@ async def manage_delete_anime_confirm(callback: CallbackQuery):
         return
 
     keyboard = InlineKeyboardBuilder()
-    keyboard.button(
+    keyboard.add(content.button(
         text="❌ Yo'q, qaytish",
         callback_data=f"manage_anime_{anime_id}"
-    )
-    keyboard.button(
+    ))
+    keyboard.add(content.button(
         text="🗑 Ha, o'chirish",
         callback_data=f"manage_confirmdelete_{anime_id}"
-    )
+    ))
     keyboard.adjust(1)
 
     await content.edit_text(callback.message,
@@ -1359,16 +1405,16 @@ async def manage_seasons_list(callback: CallbackQuery):
     keyboard = InlineKeyboardBuilder()
 
     for season in seasons:
-        keyboard.button(
+        keyboard.add(content.button(
             text=f"📺 {season['season_number']}-fasl",
             callback_data=f"manage_season_{season['id']}"
-        )
+        ))
 
-    keyboard.button(text="➕ Fasl qo‘shish", callback_data=f"addseason_{anime_id}")
+    keyboard.add(content.button(text="➕ Fasl qo‘shish", callback_data=f"addseason_{anime_id}"))
     keyboard.adjust(2)
 
     keyboard.row(
-        InlineKeyboardButton(
+        content.button(
             text="⬅️ Anime boshqaruviga qaytish",
             callback_data=f"manage_anime_{anime_id}"
         )
@@ -1398,23 +1444,23 @@ async def manage_season_detail(callback: CallbackQuery):
 
     keyboard = InlineKeyboardBuilder()
 
-    keyboard.button(
+    keyboard.add(content.button(
         text="▶️ Qismlarni boshqarish",
         callback_data=f"manage_episodes_{season_id}"
-    )
+    ))
 
-    keyboard.button(
+    keyboard.add(content.button(
         text="✏️ Fasl raqamini o'zgartirish",
         callback_data=f"season_edit_{season_id}"
-    )
-    keyboard.button(
+    ))
+    keyboard.add(content.button(
         text="🗑 Faslni o'chirish",
         callback_data=f"season_delete_{season_id}"
-    )
+    ))
     keyboard.adjust(1)
 
     keyboard.row(
-        InlineKeyboardButton(
+        content.button(
             text="⬅️ Fasllarga qaytish",
             callback_data=f"manage_seasons_{season['anime_id']}"
         )
@@ -1498,17 +1544,17 @@ async def season_edit_save(message: Message, state: FSMContext):
 
     try:
         updated = update_season_number(season_id, new_number)
-    except sqlite3.IntegrityError:
+    except db.INTEGRITY_ERRORS:
         await message.answer("❗ Bunday fasl raqami mavjud.")
         return
 
     await state.clear()
 
     keyboard = InlineKeyboardBuilder()
-    keyboard.button(
+    keyboard.add(content.button(
         text="⬅️ Fasl boshqaruviga qaytish",
         callback_data=f"manage_season_{season_id}"
-    )
+    ))
 
     await message.answer(
         "✅ Fasl raqami yangilandi!" if updated
@@ -1533,14 +1579,14 @@ async def season_delete_confirm(callback: CallbackQuery):
 
     keyboard = InlineKeyboardBuilder()
 
-    keyboard.button(
+    keyboard.add(content.button(
         text="❌ Yo'q, qaytish",
         callback_data=f"manage_season_{season_id}"
-    )
-    keyboard.button(
+    ))
+    keyboard.add(content.button(
         text="🗑 Ha, o'chirish",
         callback_data=f"season_confirmdelete_{season_id}"
-    )
+    ))
     keyboard.adjust(1)
 
     await content.edit_text(callback.message,
@@ -1603,14 +1649,14 @@ async def manage_episodes_list(callback: CallbackQuery):
     keyboard = InlineKeyboardBuilder()
 
     for episode in episodes:
-        keyboard.button(
+        keyboard.add(content.button(
             text=f"▶️ {episode['episode_number']}-qism",
             callback_data=f"manage_episode_{episode['id']}"
-        )
+        ))
 
     keyboard.adjust(4)
     keyboard.row(
-        InlineKeyboardButton(
+        content.button(
             text="⬅️ Fasl boshqaruviga qaytish",
             callback_data=f"manage_season_{season_id}"
         )
@@ -1640,22 +1686,22 @@ async def manage_episode_detail(callback: CallbackQuery):
         return
 
     keyboard = InlineKeyboardBuilder()
-    keyboard.button(
+    keyboard.add(content.button(
         text="🔢 Qism raqamini o'zgartirish",
         callback_data=f"episode_editnum_{episode_id}"
-    )
-    keyboard.button(
+    ))
+    keyboard.add(content.button(
         text="🎞 Videoni almashtirish",
         callback_data=f"episode_replace_{episode_id}"
-    )
-    keyboard.button(
+    ))
+    keyboard.add(content.button(
         text="🗑 Qismni o'chirish",
         callback_data=f"episode_delete_{episode_id}"
-    )
+    ))
     keyboard.adjust(1)
 
     keyboard.row(
-        InlineKeyboardButton(
+        content.button(
             text="⬅️ Qismlarga qaytish",
             callback_data=f"manage_episodes_{episode['season_id']}"
         )
@@ -1729,7 +1775,7 @@ async def episode_edit_number_save(message: Message, state: FSMContext):
 
     try:
         updated = update_episode_number(episode_id, new_number)
-    except sqlite3.IntegrityError:
+    except db.INTEGRITY_ERRORS:
         await message.answer(
             "❗ Bu raqamli qism shu faslda allaqachon mavjud."
         )
@@ -1738,10 +1784,10 @@ async def episode_edit_number_save(message: Message, state: FSMContext):
     await state.clear()
 
     keyboard = InlineKeyboardBuilder()
-    keyboard.button(
+    keyboard.add(content.button(
         text="⬅️ Qism boshqaruviga qaytish",
         callback_data=f"manage_episode_{episode_id}"
-    )
+    ))
 
     await message.answer(
         "✅ Qism raqami yangilandi!" if updated
@@ -1795,17 +1841,17 @@ async def episode_replace_save(message: Message, state: FSMContext):
     episode_id = data["manage_episode_id"]
     try:
         updated = update_episode_video(episode_id, media.file_id, media_type, media.file_unique_id)
-    except sqlite3.IntegrityError:
+    except db.INTEGRITY_ERRORS:
         await message.answer("Bu video ushbu faslda allaqachon mavjud.")
         return
 
     await state.clear()
 
     keyboard = InlineKeyboardBuilder()
-    keyboard.button(
+    keyboard.add(content.button(
         text="⬅️ Qism boshqaruviga qaytish",
         callback_data=f"manage_episode_{episode_id}"
-    )
+    ))
 
     await message.answer(
         "✅ Video muvaffaqiyatli almashtirildi!" if updated
@@ -1829,14 +1875,14 @@ async def episode_delete_confirm(callback: CallbackQuery):
         return
 
     keyboard = InlineKeyboardBuilder()
-    keyboard.button(
+    keyboard.add(content.button(
         text="❌ Yo'q, qaytish",
         callback_data=f"manage_episode_{episode_id}"
-    )
-    keyboard.button(
+    ))
+    keyboard.add(content.button(
         text="🗑 Ha, o'chirish",
         callback_data=f"episode_confirmdelete_{episode_id}"
-    )
+    ))
     keyboard.adjust(1)
 
     await content.edit_text(callback.message,
@@ -1867,10 +1913,10 @@ async def episode_delete_execute(callback: CallbackQuery):
 
     if deleted:
         keyboard = InlineKeyboardBuilder()
-        keyboard.button(
+        keyboard.add(content.button(
             text="⬅️ Qismlar ro'yxatiga qaytish",
             callback_data=f"manage_episodes_{episode['season_id']}"
-        )
+        ))
 
         await content.edit_text(callback.message,
             "✅ Qism bazadan o'chirildi.",
@@ -1904,10 +1950,10 @@ async def anime_search_start(
     await state.set_state(SearchAnime.query)
 
     keyboard = InlineKeyboardBuilder()
-    keyboard.button(
+    keyboard.add(content.button(
         text="❌ Bekor qilish",
         callback_data="search_cancel"
-    )
+    ))
 
     await callback.message.answer(
         "🔎 Anime qidirish\n\n"
@@ -1958,19 +2004,20 @@ async def anime_search_result(
         await message.answer("❎ Qidiruv bekor qilindi.")
         return
 
+    extras.track("search")
     results = search_animes(query)
     await state.clear()
 
     if not results:
         keyboard = InlineKeyboardBuilder()
-        keyboard.button(
+        keyboard.add(content.button(
             text="🔎 Qayta qidirish",
             callback_data="anime_search"
-        )
-        keyboard.button(
+        ))
+        keyboard.add(content.button(
             text="⬅️ Animelar ro'yxati",
             callback_data="anime_az"
-        )
+        ))
         keyboard.adjust(1)
 
         await message.answer(
@@ -1982,21 +2029,21 @@ async def anime_search_result(
     keyboard = InlineKeyboardBuilder()
 
     for anime in results:
-        keyboard.button(
+        keyboard.add(content.button(
             text=f"🎬 {anime['title']}",
             callback_data=f"anime_detail_{anime['id']}"
-        )
+        ))
 
     keyboard.adjust(1)
 
-    keyboard.button(
+    keyboard.add(content.button(
         text="🔎 Yana qidirish",
         callback_data="anime_search"
-    )
-    keyboard.button(
+    ))
+    keyboard.add(content.button(
         text="⬅️ Animelar ro'yxati",
         callback_data="anime_az"
-    )
+    ))
     keyboard.adjust(1)
 
     await message.answer(
@@ -2036,15 +2083,15 @@ async def back_home(callback: CallbackQuery, bot: Bot):
 async def about_handler(callback: CallbackQuery):
     keyboard = InlineKeyboardBuilder()
 
-    keyboard.button(
+    keyboard.add(content.button(
         text="📢 Rasmiy kanal",
         url="https://t.me/AniVrum"
-    )
+    ))
 
-    keyboard.button(
+    keyboard.add(content.button(
         text="🏠 Asosiy menyu",
         callback_data="back_main"
-    )
+    ))
 
     keyboard.adjust(1)
 
@@ -2052,7 +2099,9 @@ async def about_handler(callback: CallbackQuery):
         f"ℹ️ {content.BRAND_NAME}\n\n"
         "Katalogdan anime tanlang yoki nomi va kodi bo‘yicha qidiring. "
         "Qismlarni bittalab yoki butun fasl qilib olishingiz mumkin.\n\n"
-        "📢 Rasmiy kanal: @AniVrum",
+        "📢 Rasmiy kanal: @AniVrum\n\n"
+        "Maxfiylik: faollik sanasi va umumiy foydalanish sonlari statistikaga yoziladi. "
+        "Izoh yuborsangiz, matn va Telegram profilingiz administratorga ko‘rinadi.",
         reply_markup=keyboard.as_markup()
     )
 
@@ -2180,27 +2229,27 @@ async def show_favorites(callback: CallbackQuery):
 
         for anime in animes:
 
-            keyboard.button(
+            keyboard.add(content.button(
                 text=f"🎬 {anime['title']}",
                 callback_data=f"anime_detail_{anime['id']}"
-            )
+            ))
 
-            keyboard.button(
-                text=f"❌ {anime['title']} — o'chirish",
+            keyboard.add(content.button(
+                text=f"🗑 {anime['title']} — o'chirish",
                 callback_data=f"fav_remove_{anime['id']}"
-            )
+            ))
 
     # Animelar katalogiga o'tish
-    keyboard.button(
+    keyboard.add(content.button(
         text="🎌 Animelar katalogi",
         callback_data="anime"
-    )
+    ))
 
     # Asosiy menyuga qaytish
-    keyboard.button(
+    keyboard.add(content.button(
         text="🏠 Asosiy menyu",
         callback_data="back_main"
-    )
+    ))
 
     keyboard.adjust(1)
 
@@ -2262,20 +2311,20 @@ async def top_animes_handler(callback: CallbackQuery, bot: Bot):
                 f"👁 {anime['views']} ta ochilish\n\n"
             )
 
-            keyboard.button(
+            keyboard.add(content.button(
                 text=f"{rank} {anime['title']}",
                 callback_data=f"anime_detail_{anime['id']}"
-            )
+            ))
 
-    keyboard.button(
+    keyboard.add(content.button(
         text="🎌 Animelar katalogi",
         callback_data="anime"
-    )
+    ))
 
-    keyboard.button(
+    keyboard.add(content.button(
         text="🏠 Asosiy menyu",
         callback_data="back_main"
-    )
+    ))
 
     keyboard.adjust(1)
 
@@ -2288,6 +2337,7 @@ async def top_animes_handler(callback: CallbackQuery, bot: Bot):
 
 
 content.install(dp, lambda: ADMIN_ID, CHANNEL, is_subscribed, AddAnime)
+extras.install(dp, lambda: ADMIN_ID, CHANNEL, is_subscribed, AddAnime)
 
 
 @dp.message(StateFilter(None), F.text.regexp(r"^\s*[0-9]+\s*$"))
@@ -2307,6 +2357,7 @@ async def open_anime_by_code(message: Message, bot: Bot):
 
 @dp.errors()
 async def handle_update_error(event):
+    extras.track("error")
     log.error("Telegram yangilanishida xato. Turi: %s", type(event.exception).__name__)
 
 
@@ -2315,6 +2366,12 @@ async def main(*, load_local_env=True, handle_signals=True, database_path=None):
     global ADMIN_ID
     if load_local_env:
         load_dotenv(BASE_DIR / ".env")
+    try:
+        postgres_url = db.database_url()
+    except RuntimeError as error:
+        raise SystemExit(str(error)) from None
+    if database_path is not None and postgres_url:
+        raise SystemExit("SQLite sinov yo‘li va DATABASE_URL birga ishlatilmaydi.")
     token = os.getenv("BOT_TOKEN")
     admin = os.getenv("ADMIN_ID", "")
     if not token or not content.numeric_id(admin) or not int(admin):
@@ -2325,16 +2382,27 @@ async def main(*, load_local_env=True, handle_signals=True, database_path=None):
     if database_path is not None:
         database_path.parent.mkdir(parents=True, exist_ok=True)
         db.DB_PATH = database_path
-    store.migrate()
+    try:
+        store.migrate()
+        store.prune_statistics()
+    except db.DATABASE_ERRORS as error:
+        log.error("Ma’lumotlar bazasi ishga tayyorlanmadi. Turi: %s", type(error).__name__)
+        raise SystemExit("Ma’lumotlar bazasi ulanishi yoki sxemasini tekshiring.") from None
     try:
         bot = Bot(token=token)
     except TokenValidationError:
         raise SystemExit("BOT_TOKEN formati noto‘g‘ri.") from None
     log.info("AniVrum Telegram polling ishga tushirilmoqda.")
     try:
-        await dp.start_polling(bot, handle_signals=handle_signals)
+        await dp.start_polling(bot, handle_signals=handle_signals, close_bot_session=False)
     except TelegramAPIError:
         raise SystemExit("Telegram bilan ulanishda xato.") from None
+    finally:
+        jobs = list(season_downloads.jobs.values())
+        for job in jobs:
+            job.cancel()
+        await asyncio.gather(*jobs, return_exceptions=True)
+        await bot.session.close()
 
 
 if __name__ == "__main__":

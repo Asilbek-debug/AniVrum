@@ -22,9 +22,15 @@ async def health(request):
 
 async def run_polling():
     from bot.main import main as bot_main
-    from database.db import DEFAULT_DB_PATH
+    from database.db import DEFAULT_DB_PATH, database_url
 
     try:
+        if database_url():
+            if os.environ.get("ANIVRUM_DB_PATH"):
+                log.error("DATABASE_URL va ANIVRUM_DB_PATH birga ishlatilmaydi.")
+                return
+            await bot_main(load_local_env=False, handle_signals=False)
+            return
         default = Path(gettempdir()) / "anivrum-render-test.db"
         path = Path(os.environ.get("ANIVRUM_DB_PATH") or default).resolve()
         production_path = DEFAULT_DB_PATH.resolve()

@@ -93,3 +93,84 @@ sudo journalctl -u anivrum.service -n 50
 ## Render Auto-Deploy sinovi
 
 Bu commit GitHub orqali Render sinov servisida avtomatik deploy ishga tushishini tekshirish uchun yuboriladi.
+
+## Doimiy PostgreSQL bazasiga o'tish
+
+`DATABASE_URL` berilmasa, bot mavjud SQLite bazasidan foydalanadi. PostgreSQL
+tanlanganda bot `anivrum` sxemasida katalog, qismlar, film va OVA, e'lonlar,
+yangiliklar, captionlar, izohlar, sevimlilar va statistikani saqlaydi.
+`ANIVRUM_REQUIRE_POSTGRES=true` yoqilgan muhitda URL yo'qolsa bot SQLite'ga
+o'tmaydi. Render'da PostgreSQL tanlanganda `ANIVRUM_DB_PATH` bo'sh bo'lishi kerak.
+PostgreSQL manzili va parolini hostingning maxfiy environment sozlamasida saqlang.
+
+1. PostgreSQL'da AniVrum uchun alohida bo'sh baza yarating. Import roliga shu
+   bazada `anivrum` sxemasini yaratish va identifikator ketma-ketliklarini
+   sozlash huquqi kerak. Hosting talab qilgan TLS parametrlarini ishlating.
+   Neon `production` branch'ida `neondb` va `neondb_owner` tanlanganini
+   Dashboard'da tekshiring. Pooling o‘chirilgan URL bilan quyidagi lokal
+   tekshiruvni ishlating. URL'ni faqat yashirin so‘rov chiqqanida kiriting.
+
+   ```powershell
+   powershell.exe -NoProfile -STA -ExecutionPolicy RemoteSigned -File .\scripts\Test-NeonConnection.ps1
+   ```
+
+   Ochilgan oynaning niqoblangan maydoniga Ctrl+V yoki **Joylashtirish**
+   tugmasi bilan to‘liq URL'ni kiriting va **Tekshirish** ni bosing.
+   Skript URL'da `sslmode=require` ni talab qiladi, ulanishda esa TLS
+   sertifikatini ham tekshiradi. PostgreSQL katalogini faqat o‘qish rejimida
+   tekshiradi. Chiqish kodi `0` bo‘sh bazani, `2` mavjud jadvallar yoki
+   boshqa relationlarni, `1` ulanish yoki tekshiruv xatosini bildiradi.
+   URL faqat tekshiruv jarayoniga beriladi. Importdan oldin uni import
+   seansi uchun alohida sozlash kerak.
+2. Eski botning yagona ishlayotgan nusxasi va SQLite bilan ishlaydigan boshqa
+   yozuvchilarni aniqlang. Yakuniy ko'chirish vaqtida ularni to'xtatib, yangi
+   SQLite Backup API zaxirasi oling. Shunda import davomida yangi SQLite
+   yozuvlari ortda qolmaydi.
+3. Zaxirani quyidagi buyruq bilan tekshiring. Namuna yo'lini haqiqiy zaxira
+   nomiga almashtiring. Bu buyruq PostgreSQL bilan bog'lanmasdan v3 yoki v4
+   manbani o'qiydi va v4 jadval sonlarini chiqaradi.
+
+   ```powershell
+   .\.venv\Scripts\python.exe -m database.import_postgres --source .\backups\snapshot.db
+   ```
+
+4. Import uchun mo'ljallangan seansda `ANIVRUM_IMPORT_DATABASE_URL` ni xavfsiz
+   tarzda sozlang. Bo'sh maqsad bazasini tekshirib, avval `--apply`, keyin
+   darhol `--verify` ni bajaring. Import uchun va bot ishlashi uchun environment
+   o'zgaruvchilari alohida.
+
+   2026-11-20 kuni tekshirilgan `anivrum-20261119T223530827917Z.db` zaxirasi
+   uchun Windows'da niqoblangan import oynasidan foydalanish mumkin.
+   Oyna zaxiraning SHA-256 va yozuvlar sonini tekshiradi, Neon'ga faqat
+   o'qish rejimida ulanadi va tasdiqdan keyin `--apply` hamda `--verify`ni
+   ketma-ket bajaradi.
+
+   ```powershell
+   powershell.exe -NoProfile -STA -ExecutionPolicy RemoteSigned -File "D:\AniVrum\scripts\Import-NeonBackup.ps1"
+   ```
+
+   Qo'lda import qilish buyruqlari quyida.
+
+   ```powershell
+   .\.venv\Scripts\python.exe -m database.import_postgres --source .\backups\snapshot.db --apply
+   .\.venv\Scripts\python.exe -m database.import_postgres --source .\backups\snapshot.db --verify
+   ```
+
+   Import v3 manbani vaqtinchalik nusxada v4 ga o'tkazadi. Jadval sonlari va
+   barcha ustun qiymatlari bitta PostgreSQL tranzaksiyasida solishtiriladi.
+   Mavjud ID'lar, tarixiy kodlar, Telegram `file_id` qiymatlari va ko'rish
+   tarixi saqlanadi. Yangi ID'lar manbaning oxirgi ajratilgan ID qiymatidan
+   keyin davom etadi. Bo'sh bo'lmagan maqsadga import rad etiladi.
+5. Tekshiruvlar o'tgach, kelajakdagi asosiy hostingda `DATABASE_URL` va
+   `ANIVRUM_REQUIRE_POSTGRES=true` ni sozlang. Bir vaqtning o'zida bitta
+   asosiy polling jarayonini ishga tushiring. Eski havola, mavjud video va
+   yangi yozuvni tekshiring. Media yuborishda o'sha videolarni olgan Telegram
+   bot akkaunti ishlatilishi kerak, chunki `file_id` botga bog'langan.
+6. PostgreSQL uchun provayder zaxiralari yoki `pg_dump` orqali alohida
+   zaxiralashni yoqing va tiklashni tekshiring. SQLite zaxirasini saqlang.
+   PostgreSQL yangi yozuvlarni qabul qilganidan keyin SQLite'ga qaytishdan
+   oldin o'sha yozuvlarni PostgreSQL zaxirasida saqlab, muvofiqlashtiring.
+
+PostgreSQL integratsion testlari uchun faqat tashlab yuboriladigan lokal
+klasterdan foydalaning. `ANIVRUM_TEST_POSTGRES_URL` 127.0.0.1 manzilidagi,
+vaqtinchalik test bazalari yaratishga ruxsati bor ulanishga ishora qiladi.

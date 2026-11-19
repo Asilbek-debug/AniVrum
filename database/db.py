@@ -1,21 +1,59 @@
 
+import os
 import sqlite3
 from contextlib import closing, contextmanager
 from pathlib import Path
 
+from database import postgres
+
 # Ma'lumotlar bazasi joylashuvi
 DEFAULT_DB_PATH = Path(__file__).resolve().parent / "anivrum.db"
 DB_PATH = DEFAULT_DB_PATH
+DATABASE_ERRORS = (sqlite3.Error,)
+INTEGRITY_ERRORS = (sqlite3.IntegrityError,)
+if postgres.psycopg is not None:
+    DATABASE_ERRORS += (postgres.psycopg.Error,)
+    INTEGRITY_ERRORS += (postgres.psycopg.IntegrityError,)
+
+
+def database_url():
+    url = os.getenv("DATABASE_URL", "").strip()
+    if not url and os.getenv("ANIVRUM_REQUIRE_POSTGRES", "").strip().lower() == "true":
+        raise RuntimeError("PostgreSQL talab qilingan. DATABASE_URL sozlanishi kerak.")
+    return url
 
 
 @contextmanager
 def connection():
+    url = database_url()
+    if url:
+        with postgres.connection(url) as conn:
+            yield conn
+        return
     with closing(sqlite3.connect(DB_PATH)) as conn, conn:
         conn.row_factory = sqlite3.Row
         yield conn
 
 
+def lock_writes(conn, *tables):
+    if isinstance(conn, sqlite3.Connection):
+        conn.execute("BEGIN IMMEDIATE")
+    else:
+        # Callers supply fixed table names; the common order prevents lock inversions.
+        conn.execute(f"LOCK TABLE {', '.join(sorted(tables))} IN SHARE ROW EXCLUSIVE MODE")
+
+
+def title_order(conn):
+    if isinstance(conn, sqlite3.Connection):
+        return "a.title COLLATE NOCASE"
+    return """translate(a.title, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') COLLATE "C" """
+
+
 def create_database():
+    if database_url():
+        from database.catalog import migrate
+        migrate()
+        return
     with connection() as conn:
         cursor = conn.cursor()
 
@@ -92,6 +130,10 @@ def get_anime_by_id(anime_id):
 
 # Anime fasllari va qismlari uchun jadvallar
 def create_seasons_episodes_tables():
+    if database_url():
+        from database.catalog import migrate
+        migrate()
+        return
     with connection() as conn:
         cursor = conn.cursor()
 
@@ -128,9 +170,9 @@ def add_season(anime_id, season_number):
         cursor = conn.cursor()
 
         cursor.execute("""
-            INSERT OR IGNORE INTO seasons
+            INSERT INTO seasons
             (anime_id, season_number)
-            VALUES (?, ?)
+            VALUES (?, ?) ON CONFLICT DO NOTHING
         """, (anime_id, season_number))
 
         conn.commit()
@@ -156,9 +198,9 @@ def add_episode(season_id, episode_number, title, video_file_id=None):
         cursor = conn.cursor()
 
         cursor.execute("""
-            INSERT OR IGNORE INTO episodes
+            INSERT INTO episodes
             (season_id, episode_number, title, video_file_id)
-            VALUES (?, ?, ?, ?)
+            VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING
         """, (season_id, episode_number, title, video_file_id))
 
         conn.commit()
@@ -224,7 +266,7 @@ def add_episode_auto(season_id, video_file_id, media_type='video', file_unique_i
     with connection() as conn:
         cursor = conn.cursor()
 
-        cursor.execute("BEGIN IMMEDIATE")
+        lock_writes(conn, "episodes")
         if cursor.execute(
             "SELECT 1 FROM episodes WHERE season_id=? AND video_file_id=?",
             (season_id, video_file_id),
@@ -338,7 +380,13 @@ def update_anime_year(anime_id, year):
 def delete_anime(anime_id):
     with connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("BEGIN IMMEDIATE")
+        lock_writes(conn, "animes", "episodes", "seasons", "standalone_videos", "anime_news", "anime_comments")
+        if not isinstance(conn, sqlite3.Connection) or conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='standalone_videos'"
+        ).fetchone():
+            cursor.execute("DELETE FROM standalone_videos WHERE anime_id=?", (anime_id,))
+            cursor.execute("UPDATE anime_news SET anime_id=NULL WHERE anime_id=?", (anime_id,))
+            cursor.execute("UPDATE anime_comments SET anime_id=NULL WHERE anime_id=?", (anime_id,))
 
         cursor.execute("""
             DELETE FROM episodes
@@ -378,7 +426,7 @@ def update_season_number(season_id, new_number):
 def delete_season(season_id):
     with connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("BEGIN IMMEDIATE")
+        lock_writes(conn, "episodes", "seasons")
 
         cursor.execute(
             "DELETE FROM episodes WHERE season_id = ?",
@@ -415,7 +463,7 @@ def update_episode_number(episode_id, new_number):
 # Qism videosini almashtirish
 def update_episode_video(episode_id, video_file_id, media_type="video", file_unique_id=None):
     with connection() as conn:
-        conn.execute("BEGIN IMMEDIATE")
+        lock_writes(conn, "episodes")
         if conn.execute("""
             SELECT 1 FROM episodes WHERE season_id=(SELECT season_id FROM episodes WHERE id=?)
             AND id<>? AND video_file_id=?
@@ -468,6 +516,10 @@ def search_animes(query):
             FROM animes WHERE visible=1 AND kind='anime'
         """).fetchall()
 
+        aliases = {}
+        for video in conn.execute("SELECT anime_id,title FROM standalone_videos"):
+            aliases.setdefault(video["anime_id"], []).append(normalize_text(video["title"]))
+
     results = []
 
     for row in rows:
@@ -488,6 +540,8 @@ def search_animes(query):
         elif query in title:
             score = 0.95
 
+        elif any(query in title for title in aliases.get(anime["id"], ())):
+            score = 0.93
         elif query.isascii() and len(query) == 4 and query.isdigit() and query == str(anime["release_year"]):
             score = 0.90
         elif query in normalize_text(anime["genre"] or ""):
@@ -540,6 +594,10 @@ def search_animes(query):
 # ==========================================
 
 def create_favorites_table():
+    if database_url():
+        from database.catalog import migrate
+        migrate()
+        return
     with connection() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS favorites (
@@ -555,9 +613,10 @@ def add_favorite(user_id, anime_id):
     with connection() as conn:
         cursor = conn.execute(
             """
-            INSERT OR IGNORE INTO favorites
+            INSERT INTO favorites
             (user_id, anime_id)
             SELECT ?, id FROM animes WHERE id = ? AND visible=1 AND kind='anime'
+            ON CONFLICT DO NOTHING
             """,
             (user_id, anime_id)
         )
@@ -592,12 +651,12 @@ def get_user_favorites(user_id):
     with connection() as conn:
 
         rows = conn.execute(
-            """
+            f"""
             SELECT a.*
             FROM favorites AS f
             JOIN animes AS a ON a.id = f.anime_id
             WHERE f.user_id = ? AND a.visible=1 AND a.kind='anime'
-            ORDER BY a.title COLLATE NOCASE
+            ORDER BY {title_order(conn)}
             """,
             (user_id,)
         ).fetchall()
@@ -610,6 +669,10 @@ def get_user_favorites(user_id):
 # ==========================================
 
 def create_views_table():
+    if database_url():
+        from database.catalog import migrate
+        migrate()
+        return
     with connection() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS anime_views (
@@ -628,12 +691,16 @@ def create_views_table():
 
 
 def add_anime_view(anime_id, user_id, episode_id, season_id=None):
+    add_anime_views(anime_id, user_id, season_id, [episode_id])
+
+
+def add_anime_views(anime_id, user_id, season_id, episode_ids):
     with connection() as conn:
-        conn.execute("""
+        conn.cursor().executemany("""
             INSERT INTO anime_views
             (anime_id, user_id, episode_id, season_id)
             VALUES (?, ?, ?, ?)
-        """, (anime_id, user_id, episode_id, season_id))
+        """, ((anime_id, user_id, episode_id, season_id) for episode_id in episode_ids))
 
 
 def get_top_animes(limit=10):
