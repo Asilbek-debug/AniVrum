@@ -1,0 +1,15 @@
+[Unit]
+Description=AniVrum SQLite backup
+
+[Service]
+Type=oneshot
+User=anivrum
+Group=anivrum
+WorkingDirectory=/opt/anivrum
+ExecStart=/opt/anivrum/.venv/bin/python -m database.backup /opt/anivrum/backups
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/anivrum/backups

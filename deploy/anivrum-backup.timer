@@ -1,0 +1,10 @@
+[Unit]
+Description=Schedule daily AniVrum SQLite backup
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+Unit=anivrum-backup.service
+
+[Install]
+WantedBy=timers.target

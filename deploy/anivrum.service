@@ -1,0 +1,23 @@
+[Unit]
+Description=AniVrum Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=anivrum
+Group=anivrum
+WorkingDirectory=/opt/anivrum
+EnvironmentFile=/etc/anivrum.env
+ExecStart=/opt/anivrum/.venv/bin/python -m bot.main
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/anivrum/database
+
+[Install]
+WantedBy=multi-user.target
