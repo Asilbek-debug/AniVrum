@@ -89,3 +89,7 @@ sudo journalctl -u anivrum.service -n 50
 ```
 
 `/etc/anivrum.env` fayliga `BOT_TOKEN` va `ADMIN_ID` ni `NOM=qiymat` shaklida kiriting. Xizmat xatodan keyin qayta ishga tushadi. Kundalik zaxiralarni `/opt/anivrum/backups/` dan vaqti-vaqti bilan boshqa saqlash joyiga ko‘chiring. Tiklashda xizmatni to‘xtating, amaldagi bazani alohida saqlang, tekshirilgan zaxirani `database/anivrum.db` sifatida joylashtiring va xizmatni qayta ishga tushiring.
+
+## Render Auto-Deploy sinovi
+
+Bu commit GitHub orqali Render sinov servisida avtomatik deploy ishga tushishini tekshirish uchun yuboriladi.
