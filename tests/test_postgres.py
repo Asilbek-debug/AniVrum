@@ -126,6 +126,9 @@ class PostgresTests(unittest.TestCase):
         counts, version = self.import_fixture()
         self.assertEqual((counts["standalone_videos"], counts["anime_news"], counts["anime_comments"], version),
                          (2, 1, 1, 4))
+        with patch.dict(os.environ, {"DATABASE_URL": self.url}):
+            self.assertEqual([entry["kind"] for entry in catalog.announcement_entries(9, 0, 5)],
+                             ["season", "film", "ova"])
         with postgres.connection(self.url) as target:
             target.execute("UPDATE episodes SET video_file_id=? WHERE id=?", ("different", 81))
         with import_postgres.snapshot(self.path) as (source, _), postgres.connection(self.url) as target:

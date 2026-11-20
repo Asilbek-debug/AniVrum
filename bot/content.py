@@ -22,6 +22,7 @@ BRAND_NAME = "AniVrum | Anime"
 PAGE_SIZE = 12
 CAPTION_DESCRIPTION_LENGTH = 230
 PHOTO_CAPTION_LIMIT = 1024
+ANNOUNCEMENT_PAGE_SIZE = 20
 COUNTRY_HINT = "Davlat nomlarini vergul bilan ajratib yozing (1–100 belgi). Masalan: Yaponiya, Xitoy"
 DIVIDER = "━━━━━━━━━━━━━━━━"
 
@@ -35,11 +36,11 @@ class ContentForm(StatesGroup):
     channel_confirm = State()
 
 
-def button(*, text, callback_data=None, url=None):
+def button(*, text, callback_data=None, url=None, style=None):
     action = callback_data or ""
-    style = None
-    if not text.startswith(("⬅", "🏠", "❌ Bekor", "❌ Yo")):
-        if text.startswith("🗑") or action.startswith((
+    navigation = text.startswith(("⬅", "➡", "◀", "Keyingi ➡", "▶️ Keyingi", "🏠", "❌ Bekor", "❌ Yo"))
+    if style is None and not navigation:
+        if action.startswith((
             "manage_delete_", "manage_confirmdelete_", "season_delete_", "season_confirmdelete_",
             "episode_delete_", "episode_confirmdelete_", "p_admin_askposter_", "p_admin_deleteposter_",
             "p_admin_askreset_", "p_admin_reset_", "p_fav_remove_", "fav_remove_",
@@ -47,16 +48,28 @@ def button(*, text, callback_data=None, url=None):
             "x_delcomment_", "x_dropcomment_",
         )):
             style = "danger"
-        elif text.startswith(("➕", "✅")) or action.startswith((
+        elif action.startswith((
             "admin_add_", "addseason_", "p_fav_add_", "x_add_", "x_newnews_0",
+            "p_admin_publish_", "p_admin_repost_", "x_postnews_", "p_channel_send_",
+            "check_subscription", "p_admin_update_",
         )):
             style = "success"
-        elif text.startswith("📥") or action.startswith((
-            "check_subscription", "anime_detail_", "season_detail_", "episode_detail_",
+        elif action in {
+            "anime", "anime_search", "favorites", "top_animes", "anime_az", "anime_new",
+            "anime_popular", "anime_genres", "anime_years",
+        } or action.startswith((
+            "anime_detail_", "season_detail_", "episode_detail_",
             "choose_parts_", "numbered_parts_", "watchpart_", "download_seasons_", "downloadall_",
             "uploadseason_", "x_kind_", "x_video_", "x_videos_", "x_readnews_",
             "p_compose_text", "p_compose_photo", "p_compose_video", "p_admin_link_",
-            "episode_replace_",
+            "episode_replace_", "episode_edit", "season_edit_", "manage_edit_", "manage_anime_",
+            "manage_season_", "manage_seasons_", "manage_episodes_", "manage_episode_",
+            "p_admin_list_", "p_admin_poster_", "p_admin_post_", "p_admin_stats", "p_admin_settings",
+            "p_admin_country_", "p_admin_sync_", "p_admin_replace_", "p_admin_upload_", "p_admin_editposter_",
+            "p_admin_askupdate_", "p_admin_askrepost_", "p_compose_menu",
+            "x_manage", "x_caption_", "x_editvideo_", "x_news_", "x_adminnews_", "x_asknews_",
+            "x_comments_", "x_comment_", "x_viewcomment_", "x_stats", "x_editnews_", "x_newnews_",
+            "p_cat_", "p_repeat_", "p_desc_",
         )) or text.startswith(("Keyingi faslni", "🔗 Kanalga obuna")):
             style = "primary"
     return InlineKeyboardButton(text=text, callback_data=callback_data, url=url, style=style)
@@ -90,12 +103,12 @@ async def send_media(bot, chat_id, file_id, media_type, caption, *, protect_cont
         method = bot.send_video
         fields = {"video": file_id}
     try:
-        return await method(chat_id=chat_id, caption=caption, protect_content=protect_content, **fields)
+        return await method(chat_id=chat_id, caption=caption, parse_mode=None, protect_content=protect_content, **fields)
     except TelegramRetryAfter as error:
         if not retry:
             raise
         await asyncio.sleep(error.retry_after)
-        return await method(chat_id=chat_id, caption=caption, protect_content=protect_content, **fields)
+        return await method(chat_id=chat_id, caption=caption, parse_mode=None, protect_content=protect_content, **fields)
 
 
 async def clear_buttons(message):
@@ -181,14 +194,14 @@ def caption(item, suffix=""):
 
 def video_caption(item, season_number=None, episode_number=None, standalone=None):
     mode = item["caption_mode"]
-    if mode == "none":
-        return None
     if standalone:
         icon = "🎞" if standalone["kind"] == "film" else "⭐"
         label = "Film" if standalone["kind"] == "film" else "OVA"
-        text = f"{item['title']}\n{icon} {label} {standalone['number']} ? {standalone['title']}"
+        text = f"{limited(item['title'], 250)}\n{icon} {label} {standalone['number']} — {limited(standalone['title'], 150)}"
     else:
-        text = f"{item['title']}\n📺 {season_number}-fasl\n🎬 {episode_number}-qism"
+        text = f"{limited(item['title'], 250)}\n📺 {season_number}-fasl\n🎬 {episode_number}-qism"
+    if mode == "none":
+        return text
     if mode == "custom" and item["caption_text"]:
         text += f"\n\n{item['caption_text']}"
     footer = {"channel": "📢 @AniVrum", "bot": "https://t.me/AniVrum_bot"}.get(item["caption_link"])
@@ -198,11 +211,30 @@ def video_caption(item, season_number=None, episode_number=None, standalone=None
     return truncate_caption(text, PHOTO_CAPTION_LIMIT) or None
 
 
+def content_link(text, payload):
+    return button(text=text, url=f"https://t.me/AniVrum_bot?start={payload}", style="primary")
+
+
+def announcement_rows(anime_id, page=0):
+    items = store.announcement_entries(anime_id, page * ANNOUNCEMENT_PAGE_SIZE, ANNOUNCEMENT_PAGE_SIZE + 1)
+    rows = []
+    for entry in items[:ANNOUNCEMENT_PAGE_SIZE]:
+        kind = entry["kind"]
+        if kind == "season":
+            label, target = f"{entry['number']}-fasl", "season"
+        else:
+            label = f"{'Film' if kind == 'film' else 'OVA'} — {limited(entry['title'], 50)}"
+            target = "extra"
+        rows.append([content_link(label, f"{target}_{entry['id']}")])
+    return rows, len(items) > ANNOUNCEMENT_PAGE_SIZE
+
+
 def channel_keyboard(item):
-    return InlineKeyboardMarkup(inline_keyboard=[[button(
-        text="📥 YUKLAB OLISH",
-        url=f"https://t.me/AniVrum_bot?start=animeid_{item['id']}",
-    )]])
+    rows, more = announcement_rows(item["id"])
+    rows.insert(0, [content_link("📥 YUKLAB OLISH", f"animeid_{item['id']}")])
+    if more:
+        rows.append([content_link("Barcha fasllar, filmlar va OVA", f"catalog_{item['id']}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def detail_buttons(item, user_id):

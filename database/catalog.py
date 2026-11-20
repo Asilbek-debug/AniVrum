@@ -279,6 +279,20 @@ def statistics():
         return periods, popular, favorite, season
 
 
+def announcement_entries(anime_id, offset, limit):
+    with connection() as conn:
+        return conn.execute("""SELECT id, number, kind, title FROM (
+            SELECT s.id, s.season_number AS number, 0 AS sort_order, 'season' AS kind, '' AS title
+            FROM seasons s WHERE s.anime_id=? AND EXISTS (
+                SELECT 1 FROM episodes e WHERE e.season_id=s.id AND e.video_file_id <> ''
+            )
+            UNION ALL
+            SELECT id, number, CASE WHEN kind='film' THEN 1 ELSE 2 END, kind, title
+            FROM standalone_videos WHERE anime_id=? AND file_id <> ''
+        ) entries ORDER BY sort_order, number, id LIMIT ? OFFSET ?""",
+                            (anime_id, anime_id, limit, offset)).fetchall()
+
+
 def standalone_videos(anime_id, offset=0, limit=13):
     with connection() as conn:
         return conn.execute("""SELECT * FROM standalone_videos WHERE anime_id=?

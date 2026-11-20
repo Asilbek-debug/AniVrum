@@ -4,7 +4,6 @@ import asyncio
 import logging
 
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramRetryAfter
-from aiogram.types import InputMediaVideo
 
 from bot import content
 from database import catalog as store, db
@@ -20,77 +19,53 @@ class SeasonDownloads:
         self.next_request = 0
         self.paused_until = 0
 
-    async def send(self, request, count, earliest, attempts=4):
+    async def send(self, request, earliest, attempts=4):
         clock = self.clock or asyncio.get_running_loop().time
         for attempt in range(attempts):
             while True:
                 now = clock()
                 delay = max(earliest, self.next_request, self.paused_until) - now
                 if delay <= 0:
-                    # Keep budget for interactive traffic and account for every album item.
-                    self.next_request = now + count / 20
+                    # Keep budget for interactive traffic.
+                    self.next_request = now + 1 / 20
                     break
                 await self.wait(delay)
             try:
-                return await request(), now + count
+                await request()
+                return now + 1
             except TelegramRetryAfter as error:
                 self.paused_until = max(self.paused_until, clock() + error.retry_after)
                 if attempt == attempts - 1:
                     raise
 
     async def deliver(self, bot, message, user_id, item, season, episodes, protected):
-        status, earliest = await self.send(
-            lambda: message.answer(f"📥 {len(episodes)} ta qism yuborish boshlandi."), 1, 0
+        earliest = await self.send(
+            lambda: message.answer(f"📥 {len(episodes)} ta qism yuborish boshlandi."), 0
         )
-        index = sent = 0
+        sent = 0
         rejected = []
         stopped = None
-        albums = True
-        while index < len(episodes):
-            batch = episodes[index:index + 2]
-            episode = batch[0]
+        for episode in episodes:
             try:
-                if albums and len(batch) == 2 and all(ep["media_type"] == "video" for ep in batch):
-                    media = [
-                        InputMediaVideo(media=ep["video_file_id"], caption=content.video_caption(
-                            item, season["season_number"], ep["episode_number"]
-                        ))
-                        for ep in batch
-                    ]
-                    try:
-                        result, earliest = await self.send(
-                            lambda: bot.send_media_group(chat_id=message.chat.id, media=media,
-                                                         protect_content=protected), 2, earliest, attempts=2
-                        )
-                    except (TelegramBadRequest, TelegramRetryAfter):
-                        albums = False
-                        continue
-                    if len(result) != len(batch):
-                        stopped = f"{episode['episode_number']}-qismdan boshlab albom holati noaniq."
-                        break
-                else:
-                    batch = [episode]
-                    _, earliest = await self.send(
-                        lambda: content.send_media(
-                            bot, message.chat.id, episode["video_file_id"], episode["media_type"],
-                            content.video_caption(item, season["season_number"], episode["episode_number"]),
-                            protect_content=protected, retry=False,
-                        ), 1, earliest
-                    )
+                earliest = await self.send(
+                    lambda: content.send_media(
+                        bot, message.chat.id, episode["video_file_id"], episode["media_type"],
+                        content.video_caption(item, season["season_number"], episode["episode_number"]),
+                        protect_content=protected, retry=False,
+                    ), earliest
+                )
             except TelegramBadRequest:
                 rejected.append(episode["episode_number"])
-                index += 1
                 continue
             except TelegramAPIError as error:
                 stopped = f"{episode['episode_number']}-qismda yuborish to‘xtadi."
                 log.warning("Fasl %s, qism %s: %s", season["id"], episode["id"], type(error).__name__)
                 break
 
-            sent += len(batch)
-            index += len(batch)
+            sent += 1
             try:
                 await asyncio.to_thread(db.add_anime_views, item["id"], user_id, season["id"],
-                                        [ep["id"] for ep in batch])
+                                        [episode["id"]])
             except db.DATABASE_ERRORS:
                 log.warning("Fasl %s yuborish statistikasi saqlanmadi.", season["id"])
 
@@ -107,10 +82,4 @@ class SeasonDownloads:
                 await asyncio.to_thread(store.metric, "error", count=errors)
             except db.DATABASE_ERRORS:
                 log.warning("Fasl yuborish xatolari statistikaga yozilmadi.")
-        try:
-            await self.send(
-                lambda: bot.edit_message_text(chat_id=message.chat.id, message_id=status.message_id,
-                                              text=summary), 1, earliest
-            )
-        except TelegramBadRequest:
-            await self.send(lambda: message.answer(summary), 1, earliest)
+        await self.send(lambda: message.answer(summary), earliest)

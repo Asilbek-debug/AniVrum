@@ -30,7 +30,6 @@ class LocalTelegram(BaseSession):
         self.post_failure_message = "Sinov xatosi"
         self.edit_failure = None
         self.failed_video = None
-        self.reject_album = False
         self.throttle = 0
         self.uncertain_video = None
         self.latency = None
@@ -41,13 +40,9 @@ class LocalTelegram(BaseSession):
         if isinstance(method, (SendVideo, SendDocument, SendMediaGroup)) and self.latency:
             self.times.append(self.latency.time)
             await self.latency.wait(0.15)
-        if isinstance(method, SendMediaGroup):
-            if self.throttle:
-                self.throttle -= 1
-                raise TelegramRetryAfter(method, "Sinov", 3)
-            if self.reject_album:
-                raise TelegramBadRequest(method=method, message="Sinov albomi rad etildi")
-            return [SimpleNamespace(message_id=len(self.calls)) for _ in method.media]
+        if isinstance(method, SendVideo) and self.throttle:
+            self.throttle -= 1
+            raise TelegramRetryAfter(method, "Sinov", 3)
         if isinstance(method, SendVideo) and method.video == self.uncertain_video:
             raise TelegramNetworkError(method=method, message="Sinov tarmoq xatosi")
         if isinstance(method, GetChatMember):
@@ -158,8 +153,10 @@ class AniVrumTests(unittest.IsolatedAsyncioTestCase):
             return {button.callback_data: button.style
                     for row in markup.inline_keyboard for button in row}
 
-        self.assertTrue(all(style is None for style in styles(main.main_keyboard()).values()))
-        self.assertTrue(all(style is None for style in styles(main.anime_keyboard()).values()))
+        self.migrate()
+        self.assertEqual(styles(main.main_keyboard())["anime_search"], "primary")
+        self.assertIsNone(styles(main.main_keyboard())["about"])
+        self.assertEqual(styles(main.anime_keyboard())["anime_az"], "primary")
         self.assertEqual(styles(content.admin_menu())["admin_add_anime"], "success")
         self.assertEqual(styles(main.anime_manage_keyboard(23))["manage_delete_23"], "danger")
         self.assertEqual(styles(main.anime_manage_keyboard(23))["p_admin_list_manage_0"], None)
@@ -230,10 +227,11 @@ class AniVrumTests(unittest.IsolatedAsyncioTestCase):
         caption_edit = next(call for call in self.session.calls if isinstance(call, EditMessageCaption))
         self.assertIn("<b>Davlat:</b> AQSH", caption_edit.caption)
         for edit in (media_edit, caption_edit):
-            (row,) = edit.reply_markup.inline_keyboard
+            row = edit.reply_markup.inline_keyboard[0]
             (download,) = row
             self.assertEqual(download.text, "📥 YUKLAB OLISH")
             self.assertEqual(download.url, "https://t.me/AniVrum_bot?start=animeid_45")
+            self.assertEqual(edit.reply_markup.inline_keyboard[1][0].text, "1-fasl")
         self.assertFalse(self.channel_posts())
 
     async def test_startup_without_real_polling(self):
@@ -798,16 +796,60 @@ class AniVrumTests(unittest.IsolatedAsyncioTestCase):
                 found.append((call.video, call.caption, call.protect_content))
         return found
 
-    async def test_season_5_25_100_500_order_policy_and_latency(self):
+    async def test_announcement_links_send_selected_season_film_and_ova(self):
+        self.migrate()
+        anime, season = self.seed_season(1)
+        with db.connection() as conn:
+            conn.execute("INSERT INTO seasons(anime_id,season_number) VALUES (?,2)", (anime,))
+        film = catalog.save_video(anime, "film", 1, "Birinchi film", None, "film-file", "video")
+        ova = catalog.save_video(anime, "ova", 1, "Maxsus qism", None, "ova-file", "document")
+        self.assertEqual(await content.publish(self.bot, main.CHANNEL, anime), "sent")
+        post = next(call for call in self.session.calls if isinstance(call, (SendPhoto, SendMessage))
+                    and call.chat_id == main.CHANNEL)
+        with_links = [(row[0].text, row[0].url.split("?start=")[1])
+                      for row in post.reply_markup.inline_keyboard]
+        self.assertEqual(with_links[1:], [
+            ("1-fasl", f"season_{season}"), ("Film — Birinchi film", f"extra_{film}"),
+            ("OVA — Maxsus qism", f"extra_{ova}"),
+        ])
+        await self.update(11, text=f"/start season_{season}")
+        await self.finish_downloads()
+        self.assertEqual(self.delivered(11)[-1][0], "v1")
+
+        await self.update(12, text=f"/start extra_{film}")
+        self.assertEqual(self.delivered(12), [])
+        confirm = self.session.calls[-1].reply_markup.inline_keyboard[1][0]
+        self.assertEqual(confirm.callback_data, f"check_subscription_extra_{film}")
+        self.session.members.add(12)
+        await self.update(12, data=confirm.callback_data)
+        self.assertEqual(self.delivered(12)[-1][0], "film-file")
+
+        await self.update(11, text=f"/start extra_{ova}")
+        document = next(call for call in reversed(self.session.calls) if isinstance(call, SendDocument))
+        self.assertEqual(document.document, "ova-file")
+        self.assertIn("OVA 1 — Maxsus qism", document.caption)
+
+    async def test_announcement_overflow_lists_remaining_content(self):
+        self.migrate()
+        anime, _ = self.seed_season(1)
+        film = catalog.save_video(anime, "film", 1, "Film", None, "film-file", "video")
+        with patch.object(content, "ANNOUNCEMENT_PAGE_SIZE", 1):
+            buttons = content.channel_keyboard({"id": anime}).inline_keyboard
+            self.assertTrue(buttons[-1][0].url.endswith(f"catalog_{anime}"))
+            await self.update(11, text=f"/start catalog_{anime}")
+            next_page = self.session.calls[-1].reply_markup.inline_keyboard[-1][0]
+            await self.update(11, data=next_page.callback_data)
+            self.assertTrue(self.session.calls[-1].reply_markup.inline_keyboard[0][0].url.endswith(f"extra_{film}"))
+
+    async def test_season_order_caption_and_summary_after_last_video(self):
         self.migrate()
         anime, season = self.seed_season(500)
         self.session.latency = self.clock
-        for count in (5, 25, 100, 500):
+        for count in (5, 22, 25, 100, 500):
             with self.subTest(count=count):
                 episodes = db.get_season_episodes(season)[:count]
                 self.session.calls.clear()
                 self.session.times.clear()
-                start = self.clock.time
                 with patch.object(main, "get_season_episodes", return_value=episodes[::-1]):
                     await self.update(11, data=f"downloadall_{season}")
                     await self.finish_downloads()
@@ -816,16 +858,14 @@ class AniVrumTests(unittest.IsolatedAsyncioTestCase):
                 for index, (_, caption, protected) in enumerate(sent, 1):
                     self.assertTrue(protected)
                     self.assertEqual(caption, f"Solo Leveling\n📺 1-fasl\n🎬 {index}-qism")
-                self.assertEqual(len(self.session.times), (count+1)//2)
+                self.assertEqual(len(self.session.times), count)
+                self.assertFalse(any(isinstance(call, SendMediaGroup) for call in self.session.calls))
                 for left, right in zip(self.session.times, self.session.times[1:]):
-                    self.assertGreaterEqual(right-left, 2 - 1e-8)
-                summary = [call.text for call in self.session.calls if isinstance(call, EditMessageText)][-1]
-                self.assertIn(f"{count}/{count} ta qism", summary)
-                old = (count-1)*1.1 + count*0.15
-                new = self.session.times[-1] + 0.15 - start
-                print(f"{count} episodes: old {old:.2f}s, new {new:.2f}s through last video")
-                self.assertLessEqual(round(new, 2), round(old, 2))
-        self.assertEqual(catalog.content(anime)["views"], 630)
+                    self.assertGreaterEqual(right-left, 1 - 1e-8)
+                self.assertIsInstance(self.session.calls[-2], SendVideo)
+                self.assertIsInstance(self.session.calls[-1], SendMessage)
+                self.assertEqual(self.session.calls[-1].text, f"✅ {count}/{count} ta qism yuborildi.")
+        self.assertEqual(catalog.content(anime)["views"], 652)
 
     async def test_concurrent_seasons_and_duplicate_callbacks(self):
         self.migrate()
@@ -834,7 +874,7 @@ class AniVrumTests(unittest.IsolatedAsyncioTestCase):
         send = self.session.make_request
 
         async def pause_first_user(bot, method, timeout=None):
-            if isinstance(method, SendMediaGroup) and method.chat_id == 11 and not entered.is_set():
+            if isinstance(method, SendVideo) and method.chat_id == 11 and not entered.is_set():
                 entered.set()
                 await resume.wait()
             return await send(bot, method, timeout)
@@ -855,24 +895,21 @@ class AniVrumTests(unittest.IsolatedAsyncioTestCase):
             await self.finish_downloads()
         self.assertEqual([row[0] for row in self.delivered(11)], [f"v{i}" for i in range(1,26)])
 
-    async def test_album_retry_fallback_rejection_and_uncertain_failure(self):
+    async def test_video_retry_rejection_and_uncertain_failure(self):
         self.migrate()
         anime, season = self.seed_season(5)
         self.session.latency = self.clock
         self.session.throttle = 1
-        self.session.reject_album = True
         self.session.failed_video = "v2"
         self.session.uncertain_video = "v4"
         await self.update(11, data=f"downloadall_{season}")
         await self.finish_downloads()
         self.assertGreaterEqual(self.session.times[1] - self.session.times[0], 3)
-        attempts = [call for call in self.session.calls if isinstance(call, SendMediaGroup)]
-        self.assertEqual([item.media for item in attempts[0].media], ["v1", "v2"])
-        self.assertEqual([item.media for item in attempts[1].media], ["v1", "v2"])
+        attempts = [call for call in self.session.calls if isinstance(call, SendVideo)]
         self.assertTrue(all(call.protect_content for call in attempts))
-        self.assertEqual([call.video for call in self.session.calls if isinstance(call, SendVideo)],
-                         ["v1", "v2", "v3", "v4"])
-        summary = [call.text for call in self.session.calls if isinstance(call, EditMessageText)][-1]
+        self.assertEqual([call.video for call in attempts], ["v1", "v1", "v2", "v3", "v4"])
+        self.assertIsInstance(self.session.calls[-1], SendMessage)
+        summary = self.session.calls[-1].text
         self.assertIn("2/5", summary)
         self.assertIn("4-qismda", summary)
         self.assertIn("qismlar (1 ta): 2", summary)
@@ -884,7 +921,7 @@ class AniVrumTests(unittest.IsolatedAsyncioTestCase):
         for mode, text, link, expected in (
             ("custom", "Maxsus <&>", "channel", "Solo Leveling\n📺 1-fasl\n🎬 1-qism\n\nMaxsus <&>\n\n📢 @AniVrum"),
             ("auto", None, "bot", "Solo Leveling\n📺 1-fasl\n🎬 1-qism\n\nhttps://t.me/AniVrum_bot"),
-            ("none", None, "channel", None),
+            ("none", None, "channel", "Solo Leveling\n📺 1-fasl\n🎬 1-qism"),
         ):
             with self.subTest(mode=mode):
                 await self.update(100, data=f"x_caption_{anime}")
@@ -894,17 +931,16 @@ class AniVrumTests(unittest.IsolatedAsyncioTestCase):
                 await self.finish_downloads()
                 self.assertEqual(self.delivered(11)[0][1], expected)
 
-    async def test_second_flood_response_switches_to_single_videos(self):
+    async def test_repeated_flood_response_retries_same_video(self):
         self.migrate()
         _, season = self.seed_season(5)
         self.session.latency = self.clock
         self.session.throttle = 2
         await self.update(11, data=f"downloadall_{season}")
         await self.finish_downloads()
-        self.assertEqual(sum(isinstance(call, SendMediaGroup) for call in self.session.calls), 2)
         self.assertGreaterEqual(self.session.times[2] - self.session.times[1], 3)
         self.assertEqual([call.video for call in self.session.calls if isinstance(call, SendVideo)],
-                         ["v1", "v2", "v3", "v4", "v5"])
+                         ["v1", "v1", "v1", "v2", "v3", "v4", "v5"])
 
     def test_statistics_retention_removes_expired_records(self):
         self.migrate()

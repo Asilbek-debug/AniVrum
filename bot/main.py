@@ -48,7 +48,7 @@ from database.db import (
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command, StateFilter
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.utils.token import TokenValidationError
 from dotenv import load_dotenv
@@ -138,12 +138,13 @@ async def cancel_form(message: Message, state: FSMContext):
         await message.answer("Jarayon bekor qilindi.")
 
 
-def subscription_keyboard(anime_id=None):
+def subscription_keyboard(anime_id=None, *, target=None):
     keyboard = InlineKeyboardBuilder()
     keyboard.add(content.button(text="🔗 Kanalga obuna bo‘lish", url="https://t.me/AniVrum"))
+    destination = target or anime_id
     keyboard.add(content.button(
         text="✅ Obunani tekshirish",
-        callback_data=f"check_subscription_{anime_id}" if anime_id else "check_subscription",
+        callback_data=f"check_subscription_{destination}" if destination else "check_subscription",
     ))
     keyboard.adjust(1)
     return keyboard.as_markup()
@@ -233,6 +234,7 @@ async def show_main_menu(message: Message):
 async def start_handler(message: Message, bot: Bot, command: CommandObject, state: FSMContext):
     await state.clear()
     item = None
+    target = None
     if command.args:
         prefix, _, value = command.args.partition("_")
         if prefix == "animeid" and content.numeric_id(value):
@@ -241,11 +243,15 @@ async def start_handler(message: Message, bot: Bot, command: CommandObject, stat
                 item = anime
         elif prefix == "anime" and store.valid_code(value):
             item = store.by_legacy_code(value, "anime")
+        elif prefix in {"season", "extra", "catalog"} and content.numeric_id(value):
+            target = command.args
     if not await is_subscribed(bot, message.from_user.id):
         await message.answer(
             f"{content.BRAND_NAME}\n\nDavom etish uchun kanalga obuna bo‘ling.",
-            reply_markup=subscription_keyboard(item["id"] if item else None),
+            reply_markup=subscription_keyboard(item["id"] if item else None, target=target),
         )
+    elif target:
+        await open_announcement_target(message, bot, message.from_user.id, target)
     elif item:
         await content.show_detail(message, message.from_user.id, item["id"],
                                   protect_content=message.from_user.id != ADMIN_ID)
@@ -255,18 +261,67 @@ async def start_handler(message: Message, bot: Bot, command: CommandObject, stat
         await show_main_menu(message)
 
 
-@dp.callback_query(F.data.regexp(r"^check_subscription(?:_[0-9]{1,18})?$"))
+@dp.callback_query(F.data.regexp(r"^check_subscription(?:_(?:(?:season|extra|catalog)_)?[0-9]{1,18})?$"))
 async def check_subscription(callback: CallbackQuery, bot: Bot):
     if not await is_subscribed(bot, callback.from_user.id):
         await callback.answer("Siz hali kanalga obuna bo‘lmagansiz.", show_alert=True)
         return
     await callback.answer("Obuna tasdiqlandi.")
     suffix = callback.data.removeprefix("check_subscription")
-    if suffix:
+    if suffix and not content.numeric_id(suffix[1:]):
+        await open_announcement_target(callback.message, bot, callback.from_user.id, suffix[1:])
+    elif suffix:
         await content.show_detail(callback.message, callback.from_user.id, int(suffix[1:]), replace=True,
                                   protect_content=callback.from_user.id != ADMIN_ID)
     else:
         await content.edit_text(callback.message, f"{content.BRAND_NAME} · Asosiy menyu", reply_markup=main_keyboard())
+
+
+async def open_announcement_target(message, bot, user_id, target):
+    if not isinstance(message, Message) or message.chat.type != "private":
+        return
+    kind, _, raw_id = target.partition("_")
+    target_id = int(raw_id)
+    if kind == "extra":
+        await extras.send_standalone(message, bot, target_id, protected=user_id != ADMIN_ID)
+    elif kind == "season":
+        error = queue_season_download(message, bot, user_id, target_id)
+        if error:
+            await message.answer(error)
+    else:
+        await show_announcement_catalog(message, target_id)
+
+
+async def show_announcement_catalog(message, anime_id, page=0, *, replace=False):
+    item = store.anime_content(anime_id)
+    if not item or not item["visible"]:
+        await message.answer("Kontent topilmadi.")
+        return
+    rows, more = content.announcement_rows(anime_id, page)
+    navigation = []
+    if page:
+        navigation.append(content.button(text="⬅️ Oldingi", callback_data=f"content_page_{anime_id}_{page - 1}"))
+    if more:
+        navigation.append(content.button(text="➡️ Keyingi", callback_data=f"content_page_{anime_id}_{page + 1}"))
+    if navigation:
+        rows.append(navigation)
+    markup = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+    answer = message.edit_text if replace else message.answer
+    await answer(item["title"] if rows else "Yuborishga tayyor kontent topilmadi.",
+                 reply_markup=markup, parse_mode=None)
+
+
+@dp.callback_query(F.data.regexp(r"^content_page_[0-9]{1,18}_[0-9]{1,8}$"))
+async def announcement_catalog_page(callback: CallbackQuery, bot: Bot):
+    if not isinstance(callback.message, Message) or callback.message.chat.type != "private":
+        await callback.answer()
+        return
+    if not await is_subscribed(bot, callback.from_user.id):
+        await callback.answer("Avval kanalga obuna bo‘ling.", show_alert=True)
+        return
+    anime_id, page = map(int, callback.data.split("_")[-2:])
+    await callback.answer()
+    await show_announcement_catalog(callback.message, anime_id, page, replace=True)
 
 
 # ==========================================
@@ -959,7 +1014,7 @@ async def deliver_episode(bot, callback, episode):
     try:
         await content.send_media(
             bot, callback.message.chat.id, episode["video_file_id"], episode["media_type"],
-            f"{item['title']} · {season['season_number']}-fasl · {episode['episode_number']}-qism",
+            content.video_caption(item, season["season_number"], episode["episode_number"]),
             protect_content=callback.from_user.id != ADMIN_ID,
         )
     except TelegramAPIError:
@@ -1029,59 +1084,39 @@ async def download_entire_season(callback: CallbackQuery, bot: Bot):
         )
         return
 
-    # Faslni bazadan olish
-    season_id = int(callback.data.split("_")[-1])
-    season = get_season_by_id(season_id)
+    season_id = int(callback.data.rsplit("_", 1)[1])
+    error = queue_season_download(callback.message, bot, callback.from_user.id, season_id)
+    await callback.answer(error or "Yuborish boshlandi.", show_alert=bool(error))
 
+
+def queue_season_download(message, bot, user_id, season_id):
+    if not isinstance(message, Message) or message.chat.type != "private":
+        return "Faslni botning shaxsiy chatida yuklang."
+    season = get_season_by_id(season_id)
     item = store.anime_content(season["anime_id"]) if season else None
     if not item or not item["visible"]:
-        await callback.answer(
-            "Fasl topilmadi!",
-            show_alert=True
-        )
-        return
-
-    # Fasldagi qismlarni olish
-    episodes = get_season_episodes(season_id)
-
-    # Faqat videosi mavjud qismlar
+        return "Fasl topilmadi!"
     available = sorted(
-        [
-            ep for ep in episodes
-            if ep["video_file_id"]
-        ],
-        key=lambda ep: ep["episode_number"]
+        (ep for ep in get_season_episodes(season_id) if ep["video_file_id"]),
+        key=lambda ep: ep["episode_number"],
     )
-
     if not available:
-        await callback.answer(
-            "Bu faslda hozircha video yo'q!",
-            show_alert=True
-        )
-        return
-
-    user_id = callback.from_user.id
-    if not isinstance(callback.message, Message) or callback.message.chat.type != "private":
-        await callback.answer("Faslni botning shaxsiy chatida yuklang.", show_alert=True)
-        return
+        return "Bu faslda hozircha video yo?q!"
     jobs = season_downloads.jobs
     if user_id in jobs:
-        await callback.answer("Fasl yuborilmoqda. Iltimos, tugashini kuting.", show_alert=True)
-        return
+        return "Fasl yuborilmoqda. Iltimos, tugashini kuting."
     if len(jobs) >= 32:
-        await callback.answer("Yuklash navbati band. Keyinroq urinib ko?ring.", show_alert=True)
-        return
+        return "Yuklash navbati band. Keyinroq urinib ko?ring."
     jobs[user_id] = asyncio.create_task(run_season_download(
-        callback, bot, item, season, available
+        message, bot, user_id, item, season, available
     ))
-    await callback.answer("Yuborish boshlandi.")
+    return None
 
 
-async def run_season_download(callback, bot, item, season, episodes):
-    user_id = callback.from_user.id
+async def run_season_download(message, bot, user_id, item, season, episodes):
     try:
         await season_downloads.deliver(
-            bot, callback.message, user_id, item, season, episodes, user_id != ADMIN_ID
+            bot, message, user_id, item, season, episodes, user_id != ADMIN_ID
         )
     except TelegramAPIError as error:
         extras.track("error")

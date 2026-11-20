@@ -83,6 +83,31 @@ async def send_news(bot, chat_id, item):
     return await bot.send_message(chat_id, news_text(item), parse_mode=None)
 
 
+async def send_standalone(message, bot, video_id, *, protected):
+    video = store.standalone_video(video_id)
+    item = store.anime_content(video["anime_id"]) if video else None
+    if not item or not item["visible"] or not video["file_id"]:
+        await message.answer("Video topilmadi.")
+        return
+    try:
+        await content.send_media(bot, message.chat.id, video["file_id"], video["media_type"],
+                                 content.video_caption(item, standalone=video),
+                                 protect_content=protected)
+    except TelegramAPIError:
+        track("error")
+        await message.answer("Video yuborilmadi. Keyinroq urinib ko‘ring.")
+        return
+    track(video["kind"], video["id"])
+    metadata = []
+    for key, label in (("release_year", "📅 Yil"), ("country", "🌍 Davlat"), ("genre", "🎭 Janr")):
+        if video[key]:
+            metadata.append(f"{label}: {video[key]}")
+    if video["description"]:
+        metadata.append(video["description"])
+    if metadata:
+        await message.answer("\n".join(metadata), parse_mode=None)
+
+
 def install(router, admin_id, channel, is_subscribed, add_anime):
     router.update.outer_middleware(ActiveUsers())
 
@@ -147,28 +172,8 @@ def install(router, admin_id, channel, is_subscribed, add_anime):
     async def deliver_video(callback, bot):
         if not await reader(callback, bot):
             return
-        video = store.standalone_video(int(callback.data.rsplit("_", 1)[1]))
-        item = store.anime_content(video["anime_id"]) if video else None
-        if not item or not item["visible"]:
-            await callback.message.answer("Video topilmadi.")
-            return
-        try:
-            await content.send_media(bot, callback.message.chat.id, video["file_id"], video["media_type"],
-                                     content.video_caption(item, standalone=video),
-                                     protect_content=callback.from_user.id != admin_id())
-        except TelegramAPIError:
-            track("error")
-            await callback.message.answer("Video yuborilmadi. Keyinroq urinib ko‘ring.")
-            return
-        track(video["kind"], video["id"])
-        metadata = []
-        for key, label in (("release_year", "📅 Yil"), ("country", "🌍 Davlat"), ("genre", "🎭 Janr")):
-            if video[key]:
-                metadata.append(f"{label}: {video[key]}")
-        if video["description"]:
-            metadata.append(video["description"])
-        if metadata:
-            await callback.message.answer("\n".join(metadata), parse_mode=None)
+        await send_standalone(callback.message, bot, int(callback.data.rsplit("_", 1)[1]),
+                              protected=callback.from_user.id != admin_id())
 
     @router.callback_query(F.data.regexp(r"^x_(editvideo|deletevideo|confirmvideo)_[0-9]{1,18}$"))
     async def video_admin(callback, state):
@@ -276,7 +281,7 @@ def install(router, admin_id, channel, is_subscribed, add_anime):
         await state.set_data({"anime_id": anime_id})
         await state.set_state(ExtrasForm.caption)
         await callback.message.answer(
-            "Birinchi satrda rejimni yuboring: auto, custom yoki none.\n"
+            "Birinchi satrda rejimni yuboring: auto, custom yoki none (faqat asosiy caption).\n"
             "Ikkinchi satrda havola: channel, bot yoki -.\n"
             "Custom rejimda keyingi satrlarga caption matnini yozing."
         )
