@@ -9,7 +9,7 @@ from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramFor
 from aiogram.filters import StateFilter
 from aiogram.fsm.state import State, StatesGroup
 
-from bot import content
+from bot import activity, content
 from database import catalog as store, db
 
 log = logging.getLogger(__name__)
@@ -83,7 +83,7 @@ async def send_news(bot, chat_id, item):
     return await bot.send_message(chat_id, news_text(item), parse_mode=None)
 
 
-async def send_standalone(message, bot, video_id, *, protected):
+async def send_standalone(message, bot, video_id, *, protected, actor=None):
     video = store.standalone_video(video_id)
     item = store.anime_content(video["anime_id"]) if video else None
     if not item or not item["visible"] or not video["file_id"]:
@@ -98,6 +98,9 @@ async def send_standalone(message, bot, video_id, *, protected):
         await message.answer("Video yuborilmadi. Keyinroq urinib ko‘ring.")
         return
     track(video["kind"], video["id"])
+    actor = actor or message.from_user
+    if actor:
+        await activity.observe(message, actor.id, video["kind"], video["kind"], video_id, actor=actor)
     metadata = []
     for key, label in (("release_year", "📅 Yil"), ("country", "🌍 Davlat"), ("genre", "🎭 Janr")):
         if video[key]:
@@ -155,6 +158,8 @@ def install(router, admin_id, channel, is_subscribed, add_anime):
             reply_markup=page_markup(entries, page, f"x_{mode}_{anime_id}",
                                     "x_manage_0" if admin else f"anime_detail_{anime_id}", extra),
         )
+        if not admin:
+            await activity.observe_callback(callback, "extras", "anime", anime_id)
 
     @router.callback_query(F.data.regexp(r"^x_manage_[0-9]{1,8}$"))
     async def manage(callback):
@@ -173,7 +178,7 @@ def install(router, admin_id, channel, is_subscribed, add_anime):
         if not await reader(callback, bot):
             return
         await send_standalone(callback.message, bot, int(callback.data.rsplit("_", 1)[1]),
-                              protected=callback.from_user.id != admin_id())
+                              protected=callback.from_user.id != admin_id(), actor=callback.from_user)
 
     @router.callback_query(F.data.regexp(r"^x_(editvideo|deletevideo|confirmvideo)_[0-9]{1,18}$"))
     async def video_admin(callback, state):
@@ -313,6 +318,8 @@ def install(router, admin_id, channel, is_subscribed, add_anime):
         await callback.message.answer("📰 Anime yangiliklari" if entries else "Hozircha yangiliklar yo‘q.",
                                       reply_markup=page_markup(entries, page, f"x_{mode}",
                                                                "p_admin_home" if admin else "back_home", extra))
+        if not admin:
+            await activity.observe_callback(callback, "news")
 
     @router.callback_query(F.data.regexp(r"^x_readnews_[0-9]{1,18}$"))
     async def read_news(callback, bot):
@@ -320,6 +327,7 @@ def install(router, admin_id, channel, is_subscribed, add_anime):
             item = store.news(int(callback.data.rsplit("_", 1)[1]))
             if item:
                 await send_news(bot, callback.message.chat.id, item)
+                await activity.observe_callback(callback, "news")
             else:
                 await callback.message.answer("Yangilik topilmadi.")
 

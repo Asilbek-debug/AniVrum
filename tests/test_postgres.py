@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
-from database import catalog, db, import_postgres, postgres
+from database import activity, catalog, db, import_postgres, postgres
 
 
 class SnapshotTests(unittest.TestCase):
@@ -96,6 +96,27 @@ class PostgresTests(unittest.TestCase):
         with import_postgres.snapshot(self.path) as (source, version):
             with postgres.connection(self.url) as target:
                 return import_postgres.transfer(source, target), version
+
+    def test_activity_additive_migration_preserves_catalog_and_legacy_users(self):
+        catalog.migrate()
+        catalog.active_user(9000000001)
+        counts, _ = self.import_fixture()
+        with patch.dict(os.environ, {"DATABASE_URL": self.url}):
+            activity.migrate()
+            activity.migrate()
+            self.assertEqual(activity.find(user_id=9000000001), [])
+            activity.record(9000000001, "old", "episode", "episode", 81)
+            self.assertEqual(activity.find(user_id=9000000001), [])
+            activity.allow(9000000001)
+            activity.record(9000000001, "DemoName", "episode", "episode", 81)
+            row = activity.find(username="DEMONAME")[0]
+            self.assertEqual(row["user_id"], 9000000001)
+            self.assertIn("1-fasl · 1-qism", activity.describe(row["content_kind"], row["content_id"]))
+            activity.delete(9000000001)
+            self.assertEqual(activity.find(user_id=9000000001), [])
+            self.assertEqual(db.get_episode_by_id(81)["video_file_id"], "video-file")
+        with postgres.connection(self.url) as target:
+            self.assertEqual(import_postgres.counts(target), counts)
 
     def test_import_v3_value_verification_identity_and_reimport_safety(self):
         counts, version = self.import_fixture()

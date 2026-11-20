@@ -55,7 +55,8 @@ from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import CommandObject
 from database import catalog as store
 from database import db
-from bot import content, extras
+from bot import activity, content, extras
+from database import activity as activity_store
 from bot.season_download import SeasonDownloads
 
 log = logging.getLogger(__name__)
@@ -104,6 +105,7 @@ class SearchAnime(StatesGroup):
 
 dp = Dispatcher(events_isolation=SimpleEventIsolation())
 season_downloads = SeasonDownloads()
+activity.install(dp, lambda: ADMIN_ID)
 
 
 # Telegram ID raqamini ko'rsatish
@@ -112,6 +114,7 @@ async def my_id_handler(message: Message):
     await message.answer(
         f"🆔 Sizning Telegram ID raqamingiz: {message.from_user.id}"
     )
+    await activity.observe(message, message.from_user.id, None)
 
 
 # Kanalga obunani tekshirish
@@ -226,12 +229,15 @@ async def show_main_menu(message: Message):
         f"🎬 {content.BRAND_NAME}\n\nXush kelibsiz! Bo‘limni tanlang.",
         reply_markup=main_keyboard()
     )
+    if message.from_user:
+        await activity.observe(message, message.from_user.id, "home")
 
 
 # /start buyrug'i
 @dp.message(CommandStart())
 async def start_handler(message: Message, bot: Bot, command: CommandObject, state: FSMContext):
     await state.clear()
+    await activity.maybe_notice(message)
     item = None
     target = None
     if command.args:
@@ -249,6 +255,7 @@ async def start_handler(message: Message, bot: Bot, command: CommandObject, stat
             f"{content.BRAND_NAME}\n\nDavom etish uchun kanalga obuna bo‘ling.",
             reply_markup=subscription_keyboard(item["id"] if item else None, target=target),
         )
+        await activity.observe(message, message.from_user.id, "subscription")
     elif target:
         await open_announcement_target(message, bot, message.from_user.id, target)
     elif item:
@@ -268,30 +275,34 @@ async def check_subscription(callback: CallbackQuery, bot: Bot):
     await callback.answer("Obuna tasdiqlandi.")
     suffix = callback.data.removeprefix("check_subscription")
     if suffix and not content.numeric_id(suffix[1:]):
-        await open_announcement_target(callback.message, bot, callback.from_user.id, suffix[1:])
+        await open_announcement_target(callback.message, bot, callback.from_user.id, suffix[1:],
+                                       actor=callback.from_user)
     elif suffix:
         await content.show_detail(callback.message, callback.from_user.id, int(suffix[1:]), replace=True,
-                                  protect_content=callback.from_user.id != ADMIN_ID)
+                                  protect_content=callback.from_user.id != ADMIN_ID, actor=callback.from_user)
     else:
         await content.edit_text(callback.message, f"{content.BRAND_NAME} · Asosiy menyu", reply_markup=main_keyboard())
+        await activity.observe_callback(callback, "home")
 
 
-async def open_announcement_target(message, bot, user_id, target):
+async def open_announcement_target(message, bot, user_id, target, *, actor=None):
     if not isinstance(message, Message) or message.chat.type != "private":
         return
     kind, _, raw_id = target.partition("_")
     target_id = int(raw_id)
     if kind == "extra":
-        await extras.send_standalone(message, bot, target_id, protected=user_id != ADMIN_ID)
+        await extras.send_standalone(message, bot, target_id, protected=user_id != ADMIN_ID, actor=actor)
     elif kind == "season":
         error = queue_season_download(message, bot, user_id, target_id)
         if error:
             await message.answer(error)
+        else:
+            await activity.observe(message, user_id, "download", "season", target_id, actor=actor)
     else:
-        await show_announcement_catalog(message, target_id)
+        await show_announcement_catalog(message, target_id, actor=actor)
 
 
-async def show_announcement_catalog(message, anime_id, page=0, *, replace=False):
+async def show_announcement_catalog(message, anime_id, page=0, *, replace=False, actor=None):
     item = store.anime_content(anime_id)
     if not item or not item["visible"]:
         await message.answer("Kontent topilmadi.")
@@ -308,6 +319,9 @@ async def show_announcement_catalog(message, anime_id, page=0, *, replace=False)
     answer = message.edit_text if replace else message.answer
     await answer(item["title"] if rows else "Yuborishga tayyor kontent topilmadi.",
                  reply_markup=markup, parse_mode=None)
+    actor = actor or message.from_user
+    if actor:
+        await activity.observe(message, actor.id, "announcement", "anime", anime_id, actor=actor)
 
 
 @dp.callback_query(F.data.regexp(r"^content_page_[0-9]{1,18}_[0-9]{1,8}$"))
@@ -320,7 +334,7 @@ async def announcement_catalog_page(callback: CallbackQuery, bot: Bot):
         return
     anime_id, page = map(int, callback.data.split("_")[-2:])
     await callback.answer()
-    await show_announcement_catalog(callback.message, anime_id, page, replace=True)
+    await show_announcement_catalog(callback.message, anime_id, page, replace=True, actor=callback.from_user)
 
 
 # ==========================================
@@ -345,6 +359,7 @@ async def menu_handler(callback: CallbackQuery, bot: Bot):
         callback.message, f"🎌 {content.BRAND_NAME} · Katalog", reply_markup=anime_keyboard()
     )
     await callback.answer()
+    await activity.observe_callback(callback, "catalog")
 
 
 @dp.callback_query(F.data.regexp(r"^anime_seasons_[0-9]{1,18}$"))
@@ -393,6 +408,7 @@ async def show_anime_seasons(callback: CallbackQuery, bot: Bot):
         reply_markup=keyboard.as_markup()
     )
     await callback.answer()
+    await activity.observe_callback(callback, "seasons", "anime", anime_id)
 
 
 # Fasl ichidagi qismlarni ko'rsatish
@@ -444,6 +460,7 @@ async def show_season_episodes(callback: CallbackQuery, bot: Bot):
         reply_markup=keyboard.as_markup()
     )
     await callback.answer()
+    await activity.observe_callback(callback, "season", "season", season_id)
 
 
 # Anime qismini foydalanuvchiga yuborish
@@ -455,7 +472,9 @@ async def admin_panel(message: Message, state: FSMContext):
         await message.answer("Bu bo‘lim administrator uchun.")
         return
     await state.clear()
-    await message.answer(f"{content.BRAND_NAME} · Admin panel", reply_markup=content.admin_menu())
+    await message.answer(f"{content.BRAND_NAME} · Admin panel", reply_markup=content.admin_menu(
+        include_activity=activity.enabled() and activity.private(message, message.from_user.id)
+    ))
 
 
 # Admin anime qo'shishni boshlaydi
@@ -807,7 +826,7 @@ async def admin_finish_upload(message: Message, state: FSMContext):
     data = await state.get_data()
     season = get_season_by_id(data["season_id"])
     await state.clear()
-    markup = content.admin_menu()
+    markup = content.admin_menu(include_activity=activity.enabled() and activity.private(message, message.from_user.id))
     if season:
         anime_id = season["anime_id"]
         markup = content.buttons(
@@ -917,6 +936,7 @@ async def choose_parts_season(callback: CallbackQuery, bot: Bot):
         reply_markup=keyboard.as_markup()
     )
     await callback.answer()
+    await activity.observe_callback(callback, "seasons", "anime", anime_id)
 
 
 # 2. Raqamli qismlar - faqat videosi bor qismlar
@@ -973,6 +993,7 @@ async def numbered_parts(callback: CallbackQuery, bot: Bot):
         reply_markup=keyboard.as_markup()
     )
     await callback.answer()
+    await activity.observe_callback(callback, "season", "season", season_id)
 
 
 # ==========================================
@@ -1003,6 +1024,8 @@ async def watch_numbered_part(callback: CallbackQuery, bot: Bot):
 
     if not await deliver_episode(bot, callback, episode):
         await callback.message.answer("Qismni yuborib bo‘lmadi.")
+    else:
+        await activity.observe_callback(callback, "episode", "episode", episode_id)
 
 
 async def deliver_episode(bot, callback, episode):
@@ -1065,6 +1088,7 @@ async def choose_download_season(callback: CallbackQuery, bot: Bot):
         reply_markup=keyboard.as_markup()
     )
     await callback.answer()
+    await activity.observe_callback(callback, "seasons", "anime", anime_id)
 
 
 # ==========================================
@@ -1086,6 +1110,8 @@ async def download_entire_season(callback: CallbackQuery, bot: Bot):
     season_id = int(callback.data.rsplit("_", 1)[1])
     error = queue_season_download(callback.message, bot, callback.from_user.id, season_id)
     await callback.answer(error or "Yuborish boshlandi.", show_alert=bool(error))
+    if not error:
+        await activity.observe_callback(callback, "download", "season", season_id)
 
 
 def queue_season_download(message, bot, user_id, season_id):
@@ -1996,6 +2022,7 @@ async def anime_search_start(
         reply_markup=keyboard.as_markup()
     )
     await callback.answer()
+    await activity.observe_callback(callback, "search")
 
 
 # Qidiruvni bekor qilish
@@ -2010,6 +2037,7 @@ async def anime_search_cancel(
         "❎ Qidiruv bekor qilindi."
     )
     await callback.answer()
+    await activity.observe_callback(callback, None)
 
 
 # Anime nomi yoki kodi orqali qidirish
@@ -2058,6 +2086,7 @@ async def anime_search_result(
             f"🔎 '{query}' bo'yicha anime topilmadi.",
             reply_markup=keyboard.as_markup()
         )
+        await activity.observe(message, message.from_user.id, "search")
         return
 
     keyboard = content.MenuKeyboardBuilder()
@@ -2086,6 +2115,7 @@ async def anime_search_result(
         "Ko'rish uchun animeni tanlang:",
         reply_markup=keyboard.as_markup()
     )
+    await activity.observe(message, message.from_user.id, "search")
 
 
 # Asosiy menyuga qaytish
@@ -2107,6 +2137,7 @@ async def back_home(callback: CallbackQuery, bot: Bot):
         reply_markup=main_keyboard()
     )
     await callback.answer()
+    await activity.observe_callback(callback, "home")
 
 
 # ==========================================
@@ -2140,6 +2171,7 @@ async def about_handler(callback: CallbackQuery):
     )
 
     await callback.answer()
+    await activity.observe_callback(callback, "about")
 
 
 # ==========================================
@@ -2291,6 +2323,7 @@ async def show_favorites(callback: CallbackQuery):
         text,
         reply_markup=keyboard.as_markup()
     )
+    await activity.observe_callback(callback, "favorites")
 
 
 # Asosiy menyudagi sevimlilar tugmasi
@@ -2368,6 +2401,7 @@ async def top_animes_handler(callback: CallbackQuery, bot: Bot):
     )
 
     await callback.answer()
+    await activity.observe_callback(callback, "top")
 
 
 content.install(dp, lambda: ADMIN_ID, CHANNEL, is_subscribed, AddAnime)
@@ -2418,6 +2452,8 @@ async def main(*, load_local_env=True, handle_signals=True, database_path=None):
         db.DB_PATH = database_path
     try:
         store.migrate()
+        if activity.enabled():
+            activity_store.migrate()
         store.prune_statistics()
     except db.DATABASE_ERRORS as error:
         log.error("Ma’lumotlar bazasi ishga tayyorlanmadi. Turi: %s", type(error).__name__)
@@ -2427,12 +2463,15 @@ async def main(*, load_local_env=True, handle_signals=True, database_path=None):
     except TokenValidationError:
         raise SystemExit("BOT_TOKEN formati noto‘g‘ri.") from None
     log.info("AniVrum Telegram polling ishga tushirilmoqda.")
+    activity_cleanup = asyncio.create_task(activity.prune_loop()) if activity.enabled() else None
     try:
         await dp.start_polling(bot, handle_signals=handle_signals, close_bot_session=False)
     except TelegramAPIError:
         raise SystemExit("Telegram bilan ulanishda xato.") from None
     finally:
         jobs = list(season_downloads.jobs.values())
+        if activity_cleanup:
+            jobs.append(activity_cleanup)
         for job in jobs:
             job.cancel()
         await asyncio.gather(*jobs, return_exceptions=True)

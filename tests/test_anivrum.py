@@ -5,6 +5,7 @@ from html import unescape
 import sqlite3
 import tempfile
 import unittest
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -18,7 +19,7 @@ from aiogram.types import Update
 
 from bot import content, main
 from bot.season_download import SeasonDownloads
-from database import catalog, db
+from database import activity, catalog, db
 
 
 class LocalTelegram(BaseSession):
@@ -102,22 +103,119 @@ class AniVrumTests(unittest.IsolatedAsyncioTestCase):
     def migrate(self):
         catalog.migrate()
 
-    async def update(self, user, *, text=None, data=None, photo=None, video=None, document=None, caption=None, forward_origin=None):
+    async def update(self, user, *, text=None, data=None, photo=None, video=None, document=None,
+                     caption=None, forward_origin=None, username=None, chat_id=None, chat_type="private"):
         self.update_id += 1
         actor = {"id": user, "is_bot": False, "first_name": "Sinov"}
+        if username:
+            actor["username"] = username
         message = {"message_id": self.update_id, "date": 1700000000,
-                   "chat": {"id": user, "type": "private"}, "from": actor}
+                   "chat": {"id": chat_id if chat_id is not None else user, "type": chat_type}, "from": actor}
         for key, value in (("text", text), ("photo", photo), ("video", video), ("document", document),
                            ("caption", caption), ("forward_origin", forward_origin)):
             if value is not None:
                 message[key] = value
         if data is not None:
             message["text"] = "Sinov"
+            message["from"] = {"id": self.bot.id, "is_bot": True, "first_name": "AniVrum"}
             event = {"callback_query": {"id": str(self.update_id), "from": actor,
                      "chat_instance": "local", "data": data, "message": message}}
         else:
             event = {"message": message}
         await main.dp.feed_update(self.bot, Update.model_validate({"update_id": self.update_id, **event}))
+
+    async def test_activity_privacy_owner_and_read_only_profile(self):
+        self.enterContext(patch.dict(os.environ, {"ANIVRUM_ACTIVITY_ENABLED": "true"}))
+        self.migrate()
+        activity.migrate()
+        anime, season = self.seed_season(1)
+        await self.update(11, text=f"/start animeid_{anime}", username="FirstName")
+        self.assertTrue(any(isinstance(call, SendMessage) and "ixtiyoriy" in call.text for call in self.session.calls))
+        self.assertEqual(activity.find(user_id=11), [])
+        await self.update(11, data="privacy_allow", username="FirstName")
+        self.assertEqual(activity.find(user_id=11), [])
+
+        await self.update(11, data=f"numbered_parts_{season}", username="FirstName")
+        episode = db.get_season_episodes(season)[0]["id"]
+        await self.update(11, data=f"watchpart_{episode}", username="NextName")
+        self.assertEqual(activity.find(username="FirstName"), [])
+        self.assertEqual(activity.find(username="NEXTNAME")[0]["content_id"], episode)
+
+        for args in ({"user": 11}, {"user": 100, "chat_id": -123, "chat_type": "group"}):
+            for target in ("activity_home", "activity_search", "activity_recent_0", "activity_user_11", "activity_page_11"):
+                await self.update(data=target, **args)
+                self.assertIsInstance(self.session.calls[-1], AnswerCallbackQuery)
+                self.assertTrue(self.session.calls[-1].show_alert)
+        await self.update(100, text="/admin")
+        self.assertIn("activity_home", [b.callback_data for row in self.session.calls[-1].reply_markup.inline_keyboard for b in row])
+        await self.update(100, data="activity_search")
+        await self.update(100, text="@NextName")
+        report = self.session.calls[-1]
+        for value in ("Telegram ID: 11", "UTC+5", "🟢 Yaqinda faol", "Solo Leveling · 1-fasl · 1-qism"):
+            self.assertIn(value, report.text)
+        self.assertTrue(report.protect_content)
+
+        await self.update(100, data="activity_page_11")
+        page = self.session.calls[-1]
+        self.assertIn("Qism videosi", page.text)
+        self.assertTrue(all(b.callback_data.startswith("activity_") for row in page.reply_markup.inline_keyboard for b in row))
+
+        await self.update(11, data="anime_search", username="NextName")
+        await self.update(11, text="personal-query-xyz", username="NextName")
+        row = dict(activity.find(user_id=11)[0])
+        self.assertEqual(row["section"], "search")
+        self.assertEqual(row["content_id"], episode)
+        self.assertNotIn("personal-query-xyz", str(row))
+        await self.update(11, text="/delete_activity")
+        await self.update(11, data="privacy_delete")
+        await self.update(11, data="about", username="NextName")
+        self.assertEqual(activity.find(user_id=11), [])
+
+    async def test_activity_records_film_and_ova_selection(self):
+        self.enterContext(patch.dict(os.environ, {"ANIVRUM_ACTIVITY_ENABLED": "true"}))
+        self.migrate()
+        activity.migrate()
+        anime, _ = self.seed_season(1)
+        await self.update(11, text="/privacy")
+        await self.update(11, data="privacy_allow")
+        for kind in ("film", "ova"):
+            video = catalog.save_video(anime, kind, 1, kind.upper(), "Test description", "media-file", "video")
+            await self.update(11, text=f"/start extra_{video}")
+            row = activity.find(user_id=11)[0]
+            self.assertEqual((row["section"], row["content_kind"], row["content_id"]), (kind, kind, video))
+
+    async def test_activity_duplicate_username_and_recent_list(self):
+        self.enterContext(patch.dict(os.environ, {"ANIVRUM_ACTIVITY_ENABLED": "true"}))
+        self.migrate()
+        activity.migrate()
+        for user in (11, 12):
+            activity.allow(user)
+            activity.record(user, "SharedName", "home")
+        await self.update(100, data="activity_search")
+        await self.update(100, text="@sharedname")
+        self.assertIn("bir nechta", self.session.calls[-1].text)
+        await self.update(100, data="activity_recent_0")
+        self.assertEqual({b.callback_data for row in self.session.calls[-1].reply_markup.inline_keyboard
+                          for b in row}, {"activity_user_11", "activity_user_12", "activity_home"})
+        await self.update(100, data="activity_search")
+        await self.update(100, text="12")
+        self.assertIn("Telegram ID: 12", self.session.calls[-1].text)
+
+    def test_activity_expiry_removes_old_selection_before_active_profile(self):
+        self.migrate()
+        activity.migrate()
+        at = datetime(2026, 1, 1, tzinfo=UTC)
+        activity.allow(11, at)
+        activity.record(11, "Sample", "episode", "episode", 53, at)
+        activity.record(11, "Sample", "home", now=at + timedelta(days=29))
+        later = at + timedelta(days=30)
+        self.assertIsNone(activity.find(user_id=11, now=later)[0]["content_id"])
+        activity.prune(later)
+        with db.connection() as conn:
+            self.assertIsNone(conn.execute("SELECT content_id FROM user_activity_snapshot").fetchone()[0])
+        expired = later + timedelta(days=29)
+        self.assertEqual(activity.find(user_id=11, now=expired), [])
+        self.assertEqual(activity.prune(expired), 1)
 
     def channel_posts(self):
         return [call for call in self.session.calls

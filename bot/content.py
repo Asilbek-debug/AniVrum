@@ -18,6 +18,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from database import db
 from database import catalog as store
+from bot import activity
 
 log = logging.getLogger(__name__)
 BRAND_NAME = "AniVrum | Anime"
@@ -54,13 +55,13 @@ def button(*, text, callback_data=None, url=None, style=None):
             "episode_delete_", "episode_confirmdelete_", "p_admin_askposter_", "p_admin_deleteposter_",
             "p_admin_askreset_", "p_admin_reset_", "p_fav_remove_", "fav_remove_",
             "x_deletevideo_", "x_confirmvideo_", "x_delnews_", "x_dropnews_",
-            "x_delcomment_", "x_dropcomment_",
+            "x_delcomment_", "x_dropcomment_", "privacy_delete",
         )):
             style = "danger"
         elif action.startswith((
             "admin_add_", "addseason_", "p_fav_add_", "x_add_", "x_newnews_0",
             "p_admin_publish_", "p_admin_repost_", "x_postnews_", "p_channel_send_",
-            "check_subscription", "p_admin_update_",
+            "check_subscription", "p_admin_update_", "privacy_allow",
         )):
             style = "success"
         elif action in {
@@ -78,7 +79,7 @@ def button(*, text, callback_data=None, url=None, style=None):
             "p_admin_askupdate_", "p_admin_askrepost_", "p_compose_menu",
             "x_manage", "x_caption_", "x_editvideo_", "x_news_", "x_adminnews_", "x_asknews_",
             "x_comments_", "x_comment_", "x_viewcomment_", "x_stats", "x_editnews_", "x_newnews_",
-            "p_cat_", "p_repeat_", "p_desc_",
+            "p_cat_", "p_repeat_", "p_desc_", "activity_",
         )) or text.startswith(("Keyingi faslni", "🔗 Kanalga obuna")):
             style = "primary"
     return InlineKeyboardButton(text=text, callback_data=callback_data, url=url, style=style)
@@ -300,7 +301,7 @@ def detail_buttons(item, user_id):
     return buttons(*actions, (favorite,), (("Sevimlilarim", "favorites"), ("⬅️ Orqaga", back)))
 
 
-async def show_detail(message, user_id, anime_id, replace=False, *, protect_content=True):
+async def show_detail(message, user_id, anime_id, replace=False, *, protect_content=True, actor=None):
     item = store.anime_content(anime_id)
     if not item or not item["visible"]:
         await message.answer("Kontent topilmadi.")
@@ -313,6 +314,7 @@ async def show_detail(message, user_id, anime_id, replace=False, *, protect_cont
     suffix = f"\n\nYuborilgan videolar: {item['views']}"
     await show_content(message, item, caption(item, suffix=suffix), markup, replace,
                        protect_content=protect_content)
+    await activity.observe(message, user_id, "anime", "anime", anime_id, actor=actor)
 
 
 async def show_content(message, item, text, markup, replace=False, *, protect_content=False):
@@ -357,7 +359,7 @@ async def publish(bot, channel, anime_id, previous_post=None):
     return "sent"
 
 
-def admin_menu():
+def admin_menu(*, include_activity=False):
     return buttons(
         (("➕ Anime qo‘shish", "admin_add_anime"), ("➕ Fasl qo‘shish", "admin_add_season")),
         (("🎞 Film / ⭐ OVA", "x_manage_0"), ("📰 Anime yangiliklari", "x_adminnews_0")),
@@ -367,6 +369,7 @@ def admin_menu():
         (("📢 E’lonlar", "p_admin_list_post_0"), ("📊 Statistika", "p_admin_stats")),
         (("📤 Kanalga post yuborish", "p_compose_menu"),),
         (("⚙️ Sozlamalar", "p_admin_settings"),),
+        *(((("👥 Foydalanuvchilar nazorati", "activity_home"),),) if include_activity else ()),
     )
 
 
@@ -537,7 +540,7 @@ def install(router: Router, admin_id, channel, is_subscribed, add_anime_state):
             await callback.answer()
             await show_detail(callback.message, callback.from_user.id,
                               int(callback.data.split("_")[-1]), replace=True,
-                              protect_content=callback.from_user.id != admin_id())
+                              protect_content=callback.from_user.id != admin_id(), actor=callback.from_user)
 
     @router.callback_query(F.data.regexp(r"^p_desc_[0-9]{1,18}$"))
     async def full_description(callback, bot):
@@ -551,6 +554,7 @@ def install(router: Router, admin_id, channel, is_subscribed, add_anime_state):
         text = item["description"] or "Tavsif kiritilmagan."
         for offset in range(0, len(text), 1900):
             await callback.message.answer(text[offset:offset + 1900])
+        await activity.observe_callback(callback, "description", "anime", item["id"])
 
     @router.callback_query(F.data.regexp(r"^p_fav_(add|remove)_[0-9]{1,18}$"))
     async def favorite(callback, bot):
@@ -635,6 +639,7 @@ def install(router: Router, admin_id, channel, is_subscribed, add_anime_state):
         await callback.answer()
         await edit_text(callback.message, heading if entries else f"{heading}\n\nHozircha ma’lumot yo‘q.",
                         reply_markup=buttons(*rows))
+        await activity.observe_callback(callback, "catalog")
 
     @router.message(ContentForm.poster)
     async def add_poster(message, state):
@@ -720,7 +725,9 @@ def install(router: Router, admin_id, channel, is_subscribed, add_anime_state):
         action = callback.data.removeprefix("p_admin_")
         if action == "home":
             await callback.answer()
-            await callback.message.answer(f"{BRAND_NAME} · Admin panel", reply_markup=admin_menu())
+            await callback.message.answer(f"{BRAND_NAME} · Admin panel", reply_markup=admin_menu(
+                include_activity=activity.enabled() and activity.private(callback.message, callback.from_user.id)
+            ))
             return
         if action == "stats":
             periods, popular, favorite, season = store.statistics()
