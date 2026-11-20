@@ -4,6 +4,7 @@ import asyncio
 import logging
 import unicodedata
 from html import escape
+from itertools import groupby
 from pathlib import PurePath
 from secrets import token_hex
 
@@ -13,6 +14,7 @@ from aiogram.exceptions import (
 )
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from database import db
 from database import catalog as store
@@ -36,10 +38,17 @@ class ContentForm(StatesGroup):
     channel_confirm = State()
 
 
+def navigation_group(text):
+    if text.startswith(("⬅️ Oldingi", "➡", "◀", "Keyingi ➡", "▶️ Keyingi")):
+        return "pagination"
+    if text.startswith(("⬅", "🏠", "❌ Bekor", "❌ Yo", "Bekor qilish")):
+        return "exit"
+    return None
+
+
 def button(*, text, callback_data=None, url=None, style=None):
     action = callback_data or ""
-    navigation = text.startswith(("⬅", "➡", "◀", "Keyingi ➡", "▶️ Keyingi", "🏠", "❌ Bekor", "❌ Yo"))
-    if style is None and not navigation:
+    if style is None and not navigation_group(text):
         if action.startswith((
             "manage_delete_", "manage_confirmdelete_", "season_delete_", "season_confirmdelete_",
             "episode_delete_", "episode_confirmdelete_", "p_admin_askposter_", "p_admin_deleteposter_",
@@ -75,11 +84,38 @@ def button(*, text, callback_data=None, url=None, style=None):
     return InlineKeyboardButton(text=text, callback_data=callback_data, url=url, style=style)
 
 
+def keyboard_markup(rows):
+    def row_key(item):
+        group = navigation_group(item.text)
+        return group or ("colored" if item.style else "neutral"), item.style
+
+    sections = {name: [] for name in ("colored", "neutral", "pagination", "exit")}
+    for row in rows:
+        for (section, _), items in groupby(row, key=row_key):
+            compact_row = []
+            for item in items:
+                if compact_row and (
+                    section == "exit" or len(compact_row) == 2
+                    or len(compact_row[0].text) + len(item.text) > 38
+                ):
+                    sections[section].append(compact_row)
+                    compact_row = []
+                compact_row.append(item)
+            if compact_row:
+                sections[section].append(compact_row)
+    return InlineKeyboardMarkup(inline_keyboard=[row for section in sections.values() for row in section])
+
+
+class MenuKeyboardBuilder(InlineKeyboardBuilder):
+    def as_markup(self):
+        return keyboard_markup(self.export())
+
+
 def buttons(*rows):
-    return InlineKeyboardMarkup(inline_keyboard=[
+    return keyboard_markup(
         [button(text=label, callback_data=value) for label, value in row]
         for row in rows
-    ])
+    )
 
 
 def pick_media(message):
@@ -234,7 +270,7 @@ def channel_keyboard(item):
     rows.insert(0, [content_link("📥 YUKLAB OLISH", f"animeid_{item['id']}")])
     if more:
         rows.append([content_link("Barcha fasllar, filmlar va OVA", f"catalog_{item['id']}")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    return keyboard_markup(rows)
 
 
 def detail_buttons(item, user_id):

@@ -48,8 +48,7 @@ from database.db import (
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command, StateFilter
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.types import Message, CallbackQuery
 from aiogram.utils.token import TokenValidationError
 from dotenv import load_dotenv
 from aiogram.exceptions import TelegramAPIError
@@ -139,7 +138,7 @@ async def cancel_form(message: Message, state: FSMContext):
 
 
 def subscription_keyboard(anime_id=None, *, target=None):
-    keyboard = InlineKeyboardBuilder()
+    keyboard = content.MenuKeyboardBuilder()
     keyboard.add(content.button(text="🔗 Kanalga obuna bo‘lish", url="https://t.me/AniVrum"))
     destination = target or anime_id
     keyboard.add(content.button(
@@ -156,7 +155,7 @@ def subscription_keyboard(anime_id=None, *, target=None):
 
 
 def main_keyboard():
-    keyboard = InlineKeyboardBuilder()
+    keyboard = content.MenuKeyboardBuilder()
 
     keyboard.add(content.button(
         text="🎌 Animelar",
@@ -193,7 +192,7 @@ def main_keyboard():
 
 # Animelar katalogi tugmalari
 def anime_keyboard():
-    keyboard = InlineKeyboardBuilder()
+    keyboard = content.MenuKeyboardBuilder()
 
     keyboard.add(content.button(
         text="🔤 Alifbo bo‘yicha",
@@ -305,7 +304,7 @@ async def show_announcement_catalog(message, anime_id, page=0, *, replace=False)
         navigation.append(content.button(text="➡️ Keyingi", callback_data=f"content_page_{anime_id}_{page + 1}"))
     if navigation:
         rows.append(navigation)
-    markup = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+    markup = content.keyboard_markup(rows) if rows else None
     answer = message.edit_text if replace else message.answer
     await answer(item["title"] if rows else "Yuborishga tayyor kontent topilmadi.",
                  reply_markup=markup, parse_mode=None)
@@ -369,7 +368,7 @@ async def show_anime_seasons(callback: CallbackQuery, bot: Bot):
 
     seasons = get_anime_seasons(anime_id)
 
-    keyboard = InlineKeyboardBuilder()
+    keyboard = content.MenuKeyboardBuilder()
 
     if seasons:
         text = f"📺 {anime['title']} — Fasllar\n\n👇 Faslni tanlang:"
@@ -418,7 +417,7 @@ async def show_season_episodes(callback: CallbackQuery, bot: Bot):
 
     episodes = get_season_episodes(season_id)
 
-    keyboard = InlineKeyboardBuilder()
+    keyboard = content.MenuKeyboardBuilder()
 
     if episodes:
         text = "📺 Fasldagi qismlar\n\n👇 Qismni tanlang:"
@@ -624,7 +623,7 @@ async def receive_anime_description(message: Message, state: FSMContext):
 
 
 def admin_anime_keyboard(action):
-    keyboard = InlineKeyboardBuilder()
+    keyboard = content.MenuKeyboardBuilder()
 
     for anime in get_all_animes():
         keyboard.add(content.button(
@@ -744,7 +743,7 @@ async def admin_choose_season_for_upload(callback: CallbackQuery):
         return
 
     seasons = get_anime_seasons(anime_id)
-    keyboard = InlineKeyboardBuilder()
+    keyboard = content.MenuKeyboardBuilder()
 
     for season in seasons:
         keyboard.add(content.button(
@@ -895,7 +894,7 @@ async def choose_parts_season(callback: CallbackQuery, bot: Bot):
         return
 
     seasons = get_anime_seasons(anime_id)
-    keyboard = InlineKeyboardBuilder()
+    keyboard = content.MenuKeyboardBuilder()
 
     for season in seasons:
         keyboard.add(content.button(
@@ -942,7 +941,7 @@ async def numbered_parts(callback: CallbackQuery, bot: Bot):
         key=lambda ep: ep["episode_number"]
     )
 
-    keyboard = InlineKeyboardBuilder()
+    keyboard = content.MenuKeyboardBuilder()
 
     for episode in available:
         keyboard.add(content.button(
@@ -1043,7 +1042,7 @@ async def choose_download_season(callback: CallbackQuery, bot: Bot):
         return
 
     seasons = get_anime_seasons(anime_id)
-    keyboard = InlineKeyboardBuilder()
+    keyboard = content.MenuKeyboardBuilder()
 
     for season in seasons:
         keyboard.add(content.button(
@@ -1126,7 +1125,7 @@ async def run_season_download(message, bot, user_id, item, season, episodes):
 
 
 def anime_manage_keyboard(anime_id):
-    keyboard = InlineKeyboardBuilder()
+    keyboard = content.MenuKeyboardBuilder()
 
     fields = [
         ("📝 Nomini o'zgartirish", "title"),
@@ -1176,7 +1175,7 @@ async def admin_manage_animes(callback: CallbackQuery):
         return
 
     animes = get_all_animes()
-    keyboard = InlineKeyboardBuilder()
+    keyboard = content.MenuKeyboardBuilder()
 
     for anime in animes:
         keyboard.add(content.button(
@@ -1339,7 +1338,7 @@ async def manage_save_anime_edit(message: Message, state: FSMContext):
 
     await state.clear()
 
-    keyboard = InlineKeyboardBuilder()
+    keyboard = content.MenuKeyboardBuilder()
     keyboard.add(content.button(
         text="⬅️ Anime boshqaruviga qaytish",
         callback_data=f"manage_anime_{anime_id}"
@@ -1365,7 +1364,7 @@ async def manage_delete_anime_confirm(callback: CallbackQuery):
         await callback.answer("Anime topilmadi!", show_alert=True)
         return
 
-    keyboard = InlineKeyboardBuilder()
+    keyboard = content.MenuKeyboardBuilder()
     keyboard.add(content.button(
         text="❌ Yo'q, qaytish",
         callback_data=f"manage_anime_{anime_id}"
@@ -1437,7 +1436,7 @@ async def manage_seasons_list(callback: CallbackQuery):
         return
 
     seasons = get_anime_seasons(anime_id)
-    keyboard = InlineKeyboardBuilder()
+    keyboard = content.MenuKeyboardBuilder()
 
     for season in seasons:
         keyboard.add(content.button(
@@ -1477,7 +1476,7 @@ async def manage_season_detail(callback: CallbackQuery):
         await callback.answer("Fasl topilmadi!", show_alert=True)
         return
 
-    keyboard = InlineKeyboardBuilder()
+    keyboard = content.MenuKeyboardBuilder()
 
     keyboard.add(content.button(
         text="▶️ Qismlarni boshqarish",
@@ -1585,7 +1584,7 @@ async def season_edit_save(message: Message, state: FSMContext):
 
     await state.clear()
 
-    keyboard = InlineKeyboardBuilder()
+    keyboard = content.MenuKeyboardBuilder()
     keyboard.add(content.button(
         text="⬅️ Fasl boshqaruviga qaytish",
         callback_data=f"manage_season_{season_id}"
@@ -1612,7 +1611,7 @@ async def season_delete_confirm(callback: CallbackQuery):
         await callback.answer("Fasl topilmadi!", show_alert=True)
         return
 
-    keyboard = InlineKeyboardBuilder()
+    keyboard = content.MenuKeyboardBuilder()
 
     keyboard.add(content.button(
         text="❌ Yo'q, qaytish",
@@ -1681,7 +1680,7 @@ async def manage_episodes_list(callback: CallbackQuery):
         return
 
     episodes = get_season_episodes(season_id)
-    keyboard = InlineKeyboardBuilder()
+    keyboard = content.MenuKeyboardBuilder()
 
     for episode in episodes:
         keyboard.add(content.button(
@@ -1720,7 +1719,7 @@ async def manage_episode_detail(callback: CallbackQuery):
         await callback.answer("Qism topilmadi!", show_alert=True)
         return
 
-    keyboard = InlineKeyboardBuilder()
+    keyboard = content.MenuKeyboardBuilder()
     keyboard.add(content.button(
         text="🔢 Qism raqamini o'zgartirish",
         callback_data=f"episode_editnum_{episode_id}"
@@ -1818,7 +1817,7 @@ async def episode_edit_number_save(message: Message, state: FSMContext):
 
     await state.clear()
 
-    keyboard = InlineKeyboardBuilder()
+    keyboard = content.MenuKeyboardBuilder()
     keyboard.add(content.button(
         text="⬅️ Qism boshqaruviga qaytish",
         callback_data=f"manage_episode_{episode_id}"
@@ -1882,7 +1881,7 @@ async def episode_replace_save(message: Message, state: FSMContext):
 
     await state.clear()
 
-    keyboard = InlineKeyboardBuilder()
+    keyboard = content.MenuKeyboardBuilder()
     keyboard.add(content.button(
         text="⬅️ Qism boshqaruviga qaytish",
         callback_data=f"manage_episode_{episode_id}"
@@ -1909,7 +1908,7 @@ async def episode_delete_confirm(callback: CallbackQuery):
         await callback.answer("Qism topilmadi!", show_alert=True)
         return
 
-    keyboard = InlineKeyboardBuilder()
+    keyboard = content.MenuKeyboardBuilder()
     keyboard.add(content.button(
         text="❌ Yo'q, qaytish",
         callback_data=f"manage_episode_{episode_id}"
@@ -1947,7 +1946,7 @@ async def episode_delete_execute(callback: CallbackQuery):
     deleted = delete_episode(episode_id)
 
     if deleted:
-        keyboard = InlineKeyboardBuilder()
+        keyboard = content.MenuKeyboardBuilder()
         keyboard.add(content.button(
             text="⬅️ Qismlar ro'yxatiga qaytish",
             callback_data=f"manage_episodes_{episode['season_id']}"
@@ -1984,7 +1983,7 @@ async def anime_search_start(
 
     await state.set_state(SearchAnime.query)
 
-    keyboard = InlineKeyboardBuilder()
+    keyboard = content.MenuKeyboardBuilder()
     keyboard.add(content.button(
         text="❌ Bekor qilish",
         callback_data="search_cancel"
@@ -2044,7 +2043,7 @@ async def anime_search_result(
     await state.clear()
 
     if not results:
-        keyboard = InlineKeyboardBuilder()
+        keyboard = content.MenuKeyboardBuilder()
         keyboard.add(content.button(
             text="🔎 Qayta qidirish",
             callback_data="anime_search"
@@ -2061,7 +2060,7 @@ async def anime_search_result(
         )
         return
 
-    keyboard = InlineKeyboardBuilder()
+    keyboard = content.MenuKeyboardBuilder()
 
     for anime in results:
         keyboard.add(content.button(
@@ -2116,7 +2115,7 @@ async def back_home(callback: CallbackQuery, bot: Bot):
 
 @dp.callback_query(F.data == "about")
 async def about_handler(callback: CallbackQuery):
-    keyboard = InlineKeyboardBuilder()
+    keyboard = content.MenuKeyboardBuilder()
 
     keyboard.add(content.button(
         text="📢 Rasmiy kanal",
@@ -2245,7 +2244,7 @@ async def show_favorites(callback: CallbackQuery):
 
     animes = get_user_favorites(callback.from_user.id)
 
-    keyboard = InlineKeyboardBuilder()
+    keyboard = content.MenuKeyboardBuilder()
 
     if not animes:
         text = (
@@ -2321,7 +2320,7 @@ async def top_animes_handler(callback: CallbackQuery, bot: Bot):
         return
 
     animes = get_top_animes(10)
-    keyboard = InlineKeyboardBuilder()
+    keyboard = content.MenuKeyboardBuilder()
 
     if not animes:
         text = (

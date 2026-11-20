@@ -169,6 +169,27 @@ class AniVrumTests(unittest.IsolatedAsyncioTestCase):
         link = content.channel_keyboard({"id": 23}).inline_keyboard[0][0]
         self.assertEqual((link.style, link.url), ("primary", "https://t.me/AniVrum_bot?start=animeid_23"))
 
+    def test_keyboard_rows_keep_colors_actions_and_navigation_separate(self):
+        neutral = content.button(text="Bot haqida", callback_data="about")
+        back = content.button(text="⬅️ Orqaga", callback_data="anime_az")
+        previous = content.button(text="⬅️ Oldingi", callback_data="content_page_23_0")
+        following = content.button(text="➡️ Keyingi", callback_data="content_page_23_2")
+        cancel = content.button(text="Bekor qilish", callback_data="search_cancel")
+        link = content.button(text="Fasl", url="https://t.me/AniVrum_bot?start=season_5", style="primary")
+        search = content.button(text="Qidiruv", callback_data="anime_search")
+        third = content.button(text="Animelar", callback_data="anime")
+        delete = content.button(text="O‘chirish", callback_data="manage_delete_23")
+        long_action = content.button(text="Anime ma’lumotlarini tahrirlash", callback_data="manage_edit_title_23")
+        other_action = content.button(text="Faslni boshqarish", callback_data="manage_seasons_23")
+        markup = content.keyboard_markup([
+            [neutral, back], [previous, following], [link, search, third, delete],
+            [long_action, other_action], [cancel],
+        ])
+        self.assertEqual(markup.inline_keyboard, [
+            [link, search], [third], [delete], [long_action], [other_action],
+            [neutral], [previous, following], [back], [cancel],
+        ])
+
     async def test_existing_v1_announcement_and_country_edit(self):
         with db.connection() as conn:
             catalog._migrate_v1(conn)
@@ -492,7 +513,7 @@ class AniVrumTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(preview.photo, "poster")
                 self.assertIn("ANIVRUM | ANIME", preview.caption)
                 self.assertNotIn("YANGI ANIME", preview.caption)
-                confirm, cancel = preview.reply_markup.inline_keyboard[0]
+                [[confirm], [cancel]] = preview.reply_markup.inline_keyboard
                 await self.update(100, data=cancel.callback_data)
                 await self.update(100, data=confirm.callback_data)
                 self.assertEqual(len(self.channel_posts()), count)
@@ -528,7 +549,9 @@ class AniVrumTests(unittest.IsolatedAsyncioTestCase):
         await self.update(11, data="p_compose_menu")
         self.assertTrue(self.session.calls[-1].show_alert)
         await self.update(100, data="p_compose_menu")
-        choices = self.session.calls[-1].reply_markup.inline_keyboard[0]
+        rows = self.session.calls[-1].reply_markup.inline_keyboard
+        self.assertEqual([button.callback_data for button in rows[-1]], ["p_admin_home"])
+        choices = [button for row in rows[:-1] for button in row]
         for button, (kind, fields, method, text_field) in zip(choices, cases, strict=True):
             with self.subTest(kind=kind):
                 await self.update(100, data=button.callback_data)
@@ -542,7 +565,7 @@ class AniVrumTests(unittest.IsolatedAsyncioTestCase):
                 preview = self.session.calls[-1]
                 self.assertIsInstance(preview, method)
                 self.assertEqual(preview.chat_id, 100)
-                confirm, cancel = preview.reply_markup.inline_keyboard[0]
+                [[confirm], [cancel]] = preview.reply_markup.inline_keyboard
                 start = len(self.session.calls)
                 if kind == "text":
                     await self.update(100, data=cancel.callback_data)
@@ -614,7 +637,7 @@ class AniVrumTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("AniVrum | Anime", message.text)
         self.assertEqual(
             [[button.callback_data for button in row] for row in message.reply_markup.inline_keyboard],
-            [["anime", "anime_search"], ["favorites", "top_animes"], ["x_news_0", "about"]],
+            [["anime", "anime_search"], ["favorites", "top_animes"], ["x_news_0"], ["about"]],
         )
         await self.update(11, data="about")
         self.assertIn("AniVrum | Anime", self.session.calls[-2].text)
