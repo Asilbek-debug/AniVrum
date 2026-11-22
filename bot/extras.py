@@ -1,5 +1,6 @@
 """Standalone videos, news, comments, and owner statistics."""
 
+import asyncio
 import logging
 import os
 from datetime import UTC, datetime
@@ -18,9 +19,7 @@ PAGE = 10
 
 
 class ExtrasForm(StatesGroup):
-    video = State()
-    video_metadata = State()
-    video_media = State()
+    video_create = State()
     caption = State()
     news = State()
     news_photo = State()
@@ -42,10 +41,10 @@ class ActiveUsers(BaseMiddleware):
         chat = data.get("event_chat")
         if user and chat and chat.type == "private" and not user.is_bot:
             try:
-                store.active_user(user.id)
+                await asyncio.to_thread(store.active_user, user.id)
                 today = datetime.now(UTC).date()
                 if self.last_prune != today:
-                    store.prune_statistics()
+                    await asyncio.to_thread(store.prune_statistics)
                     self.last_prune = today
             except db.DATABASE_ERRORS:
                 log.warning("Faol foydalanuvchi statistikasi yozilmadi.")
@@ -92,7 +91,7 @@ async def send_standalone(message, bot, video_id, *, protected, actor=None):
     try:
         await content.send_media(bot, message.chat.id, video["file_id"], video["media_type"],
                                  content.video_caption(item, standalone=video),
-                                 protect_content=protected)
+                                 protect_content=protected, cover=video["poster_file_id"])
     except TelegramAPIError:
         track("error")
         await message.answer("Video yuborilmadi. Keyinroq urinib ko‘ring.")
@@ -171,7 +170,61 @@ def install(router, admin_id, channel, is_subscribed, add_anime):
                 ORDER BY id DESC LIMIT ? OFFSET ?""", (PAGE + 1, page * PAGE)).fetchall()
         entries = [(content.limited(item["title"], 55), f"x_manageanime_{item['id']}_0") for item in items]
         await callback.message.answer("📋 Barcha kontent" if entries else "Kontent topilmadi.",
-                                      reply_markup=page_markup(entries, page, "x_manage", "p_admin_home"))
+                                      reply_markup=page_markup(entries, page, "x_manage", "p_admin_home",
+                                                               ((("➕ Yangi film yoki OVA", "x_newextra"),),)))
+
+    @router.callback_query(F.data == "x_newextra")
+    async def choose_extra_kind(callback, state):
+        if not await owner(callback):
+            return
+        await state.clear()
+        await callback.message.answer("Qo‘shiladigan kontent turini tanlang.", reply_markup=content.buttons(
+            ((LABELS["film"], "x_scope_film"), (LABELS["ova"], "x_scope_ova")),
+            (("⬅️ Orqaga", "x_manage_0"),),
+        ))
+
+    @router.callback_query(F.data.regexp(r"^x_scope_(film|ova)$"))
+    async def choose_extra_scope(callback):
+        if not await owner(callback):
+            return
+        kind = callback.data.rsplit("_", 1)[1]
+        await callback.message.answer("Kontent qayerda ko‘rinsin?", reply_markup=content.buttons(
+            (("Mustaqil katalog elementi", f"x_indraft_{kind}"),),
+            (("Mavjud anime tarkibida", f"x_link_{kind}_0"),),
+            (("⬅️ Orqaga", "x_newextra"),),
+        ))
+
+    @router.callback_query(F.data.regexp(r"^x_indraft_(film|ova)$"))
+    async def independent_draft(callback, state):
+        if not await owner(callback):
+            return
+        kind = callback.data.rsplit("_", 1)[1]
+        await state.set_data({"kind": "anime", "initial_video": kind})
+        await state.set_state(add_anime.title)
+        await callback.message.answer(f"{LABELS[kind]} nomini yuboring.", reply_markup=content.buttons(
+            (("❌ Bekor qilish", "v5_anime_cancel_0"),),
+        ))
+
+    @router.callback_query(F.data.regexp(r"^x_link_(film|ova)_[0-9]{1,8}$"))
+    async def choose_extra_anime(callback):
+        if not await owner(callback):
+            return
+        _, _, kind, raw_page = callback.data.split("_")
+        page = int(raw_page)
+        items = await asyncio.to_thread(store.admin_catalog, "", page * PAGE, PAGE + 1)
+        entries = [(content.limited(item["title"], 55), f"x_add_{kind}_{item['id']}") for item in items]
+        await callback.message.answer("Animeni tanlang." if entries else "Anime topilmadi.",
+                                      reply_markup=page_markup(entries, page, f"x_link_{kind}", f"x_scope_{kind}"))
+
+    @router.callback_query(F.data.regexp(r"^x_independent_[0-9]{1,8}$"))
+    async def show_independent(callback, bot):
+        if not await reader(callback, bot):
+            return
+        page = int(callback.data.rsplit("_", 1)[1])
+        items = await asyncio.to_thread(store.independent_catalog, page * PAGE, PAGE + 1)
+        entries = [(content.limited(item["title"], 55), f"anime_detail_{item['id']}") for item in items]
+        await content.edit_text(callback.message, "🎬 Mustaqil filmlar va OVA" if entries else "Hozircha kontent yo‘q.",
+                                reply_markup=page_markup(entries, page, "x_independent", "anime"))
 
     @router.callback_query(F.data.regexp(r"^x_video_[0-9]{1,18}$"))
     async def deliver_video(callback, bot):
@@ -198,13 +251,75 @@ def install(router, admin_id, channel, is_subscribed, add_anime):
             await callback.message.answer(f"{video_label(video)} o‘chirilsinmi?", reply_markup=content.buttons(
                 (("🗑 O‘chirish", f"x_confirmvideo_{video['id']}"), ("❌ Bekor qilish", back))))
         else:
-            await state.set_data({"video_id": video["id"], "anime_id": video["anime_id"], "kind": video["kind"]})
-            await state.set_state(ExtrasForm.video)
-            current = f"{video['number']}\n{video['title']}\n{video['description'] or ''}"
-            await callback.message.answer(
-                f"✏️ Raqam, nom va ixtiyoriy tavsifni alohida satrlarda yuboring.\n\n{current}",
-                reply_markup=content.buttons((("🗑 O‘chirish", f"x_deletevideo_{video['id']}"),)),
-            )
+            fields = {key: video[key] for key in (*[field for field, _ in VIDEO_STEPS[:-1]],
+                                                "anime_id", "kind", "media_type")}
+            season = await asyncio.to_thread(db.get_season_by_id, video["season_id"]) if video["season_id"] else None
+            await state.set_data({**fields, "video_id": video["id"],
+                                  "season_number": season["season_number"] if season else None})
+            await state.set_state(ExtrasForm.video_create)
+            await video_step(callback.message, state, 1)
+
+    @router.callback_query(F.data.regexp(r"^x_movevideo_[0-9]{1,18}$"))
+    async def select_video_location(callback, state):
+        if not await owner(callback):
+            return
+        video = await asyncio.to_thread(store.standalone_video, int(callback.data.rsplit("_", 1)[1]))
+        if video:
+            await state.set_data({"anime_id": video["anime_id"], "move_video_id": video["id"]})
+            await state.set_state(ExtrasForm.video_create)
+            await video_step(callback.message, state, 0)
+
+    VIDEO_STEPS = (
+        ("season_id", "📺 Fasl raqamini kiriting yoki fasldan tashqarida saqlang."),
+        ("title", "✏️ Film yoki OVA nomini yuboring."),
+        ("number", "🔢 Film yoki OVA raqamini yuboring."),
+        ("genre", "🎭 Janrini yuboring."),
+        ("country", "🌍 Davlatini yuboring."),
+        ("release_year", "📅 Chiqarilgan yilini yuboring."),
+        ("description", "📝 Tavsifini yuboring."),
+        ("poster_file_id", "🖼 Poster rasmini yuboring."),
+        ("file_id", "📤 Video yoki video hujjatini yuboring."),
+        ("review", "Saqlashdan oldin tekshiring."),
+    )
+
+    async def video_step(message, state, step):
+        data = await state.update_data(video_step=step)
+        _, prompt = VIDEO_STEPS[step]
+        rows = []
+        if step == 0:
+            rows.append((("Anime tarkibida, fasldan tashqarida", "xv_skip_0"),))
+        if 2 <= step <= 7 or data.get("video_id") and 1 <= step <= 8:
+            label = "⏭ Avvalgisini saqlash" if data.get("video_id") else "⏭ O‘tkazish"
+            rows.append(((label, f"xv_skip_{step}"),))
+        if step == 1 and data.get("video_id"):
+            video_id = data["video_id"]
+            rows.append((("🟠 Joyini o‘zgartirish", f"x_movevideo_{video_id}"),
+                         ("🗑 O‘chirish", f"x_deletevideo_{video_id}")))
+        if step == 9:
+            label = LABELS[data["kind"]]
+            prompt = (f"{label} · {data['title']}\n🔢 Raqam: {data.get('number') or 'Avtomatik'}"
+                      f"\n📺 Joyi: {data.get('season_number') or 'Fasldan tashqarida'}"
+                      f"\n🎭 Janr: {data.get('genre') or '—'}\n🌍 Davlat: {data.get('country') or '—'}"
+                      f"\n📅 Yil: {data.get('release_year') or '—'}"
+                      f"\n🖼 Poster: {'Bor' if data.get('poster_file_id') else 'Yo‘q'}\n✅ Video qabul qilindi.")
+            if data.get("description"):
+                prompt += f"\n\n{data['description']}"
+            rows.append((("✅ Saqlash va tasdiqlash", "xv_save_9"),))
+        if step and not (step == 1 and data.get("video_id")):
+            rows.append((("⬅️ Orqaga", f"xv_back_{step}"),))
+        rows.append((("❌ Bekor qilish", f"xv_cancel_{step}"),))
+        await message.answer(prompt, parse_mode=None, reply_markup=content.buttons(*rows))
+
+    async def set_video_location(message, state, season):
+        data = await state.get_data()
+        season_id = season["id"] if season else None
+        if data.get("move_video_id"):
+            changed = await asyncio.to_thread(store.move_video, data["move_video_id"], season_id)
+            await state.clear()
+            await message.answer("Video joyi saqlandi." if changed else "Video yoki fasl topilmadi.")
+            return
+        await state.update_data(season_id=season_id, season_number=season["season_number"] if season else None)
+        await video_step(message, state, 1)
 
     @router.callback_query(F.data.regexp(r"^x_add_(film|ova)_[0-9]{1,18}$"))
     async def add_video(callback, state):
@@ -215,68 +330,97 @@ def install(router, admin_id, channel, is_subscribed, add_anime):
             await callback.message.answer("Anime topilmadi.")
             return
         await state.set_data({"anime_id": int(raw_id), "kind": kind})
-        await state.set_state(ExtrasForm.video)
-        await callback.message.answer("Raqam, nom va ixtiyoriy tavsifni alohida satrlarda yuboring.\n\n1\nFilm nomi\nTavsif")
+        await state.set_state(ExtrasForm.video_create)
+        await video_step(callback.message, state, 0)
 
-    @router.message(ExtrasForm.video, F.from_user.id.func(lambda value: value == admin_id()))
-    async def video_fields(message, state):
-        lines = (message.text or "").strip().split("\n", 2)
-        if len(lines) < 2 or not content.numeric_id(lines[0]) or not int(lines[0]) or not 1 <= len(lines[1].strip()) <= 100 or (len(lines) == 3 and len(lines[2]) > 2500):
-            await message.answer("Raqam, 1–100 belgili nom va ixtiyoriy tavsifni alohida satrlarda yuboring.")
+    @router.callback_query(StateFilter(ExtrasForm.video_create), F.data.regexp(r"^xv_(skip|save|back|cancel)_[0-9]$"))
+    async def video_create_navigation(callback, state):
+        if not await owner(callback):
             return
-        await state.update_data(number=int(lines[0]), title=lines[1].strip(),
-                                description=(lines[2].strip() or None) if len(lines) == 3 else None)
-        await state.set_state(ExtrasForm.video_metadata)
-        await message.answer("Ixtiyoriy yil, davlat va janrni uchta satrda yuboring. "
-                             "Bo‘sh maydon uchun -, barchasini o‘tkazish uchun /skip yozing.")
-
-    @router.message(ExtrasForm.video_metadata, F.from_user.id.func(lambda value: value == admin_id()))
-    async def video_metadata(message, state):
+        _, action, raw_step = callback.data.split("_")
+        step = int(raw_step)
         data = await state.get_data()
+        if data.get("video_step") != step:
+            return
+        message = callback.message
+        if action == "cancel":
+            await state.clear()
+            await message.answer("Jarayon bekor qilindi.")
+        elif action == "back" and step and not (step == 1 and data.get("video_id")):
+            await video_step(message, state, step - 1)
+        elif action == "skip" and step == 0:
+            await set_video_location(message, state, None)
+        elif action == "skip" and (2 <= step <= 7 or data.get("video_id") and 1 <= step <= 8):
+            if not data.get("video_id"):
+                await state.update_data({VIDEO_STEPS[step][0]: None})
+            await video_step(message, state, step + 1)
+        elif action == "save" and step == 9:
+            args = {field: data.get(field) for field, _ in VIDEO_STEPS[:-1]}
+            args.update(anime_id=data["anime_id"], kind=data["kind"], media_type=data["media_type"],
+                        video_id=data.get("video_id"))
+            try:
+                saved = await asyncio.to_thread(store.save_video, **args)
+            except db.INTEGRITY_ERRORS:
+                await message.answer("Bu raqam band. Boshqa raqam kiriting.")
+                await video_step(message, state, 2)
+                return
+            except db.DATABASE_ERRORS:
+                await message.answer("Video saqlanmadi. Keyinroq qayta urinib ko‘ring.")
+                return
+            if not saved:
+                await message.answer("Anime yoki fasl topilmadi.")
+                await video_step(message, state, 0)
+                return
+            await state.clear()
+            anime = data["anime_id"]
+            await message.answer("✅ Video saqlandi.", reply_markup=content.buttons(
+                (("➕ Yana film", f"x_add_film_{anime}"), ("➕ Yana OVA", f"x_add_ova_{anime}")),
+                (("🏁 Yakunlash", f"x_manageanime_{anime}_0"),),
+                (("📢 E’lonni ko‘rib chiqish", f"p_admin_post_{anime}"),),
+            ))
+
+    @router.message(ExtrasForm.video_create, F.from_user.id.func(lambda value: value == admin_id()))
+    async def video_create_input(message, state):
+        data = await state.get_data()
+        step = data["video_step"]
         raw = (message.text or "").strip()
-        if raw == "/skip":
-            existing = store.standalone_video(data["video_id"]) if data.get("video_id") else None
-            metadata = {key: existing[key] if existing else None for key in ("release_year", "country", "genre")}
-        else:
-            lines = [line.strip() for line in raw.split("\n")]
-            if len(lines) != 3:
-                await message.answer("Yil, davlat va janrni yuboring. Masalan: 2025\nYaponiya\n-")
+        if step == 0:
+            if raw == "/skip":
+                await set_video_location(message, state, None)
                 return
-            year, country, genre = lines
-            country_value = content.normalize_country(country) if country != "-" else None
-            if (year != "-" and (not content.numeric_id(year) or not 1900 <= int(year) <= 2100)
-                    or country != "-" and not country_value or len(genre) > 100):
-                await message.answer("Yilni 1900–2100 oralig‘ida va davlat nomini to‘g‘ri yozing.")
-                return
-            metadata = {"release_year": int(year) if year != "-" else None, "country": country_value,
-                        "genre": genre if genre and genre != "-" else None}
-        await state.update_data(**metadata)
-        await state.set_state(ExtrasForm.video_media)
-        await message.answer("Videoni yuboring." if not data.get("video_id") else
-                             "Yangi videoni yuboring yoki eskisini saqlash uchun /skip yozing.")
-
-    @router.message(ExtrasForm.video_media, F.from_user.id.func(lambda value: value == admin_id()))
-    async def video_media(message, state):
-        data = await state.get_data()
-        media, media_type = content.pick_media(message)
-        existing = store.standalone_video(data["video_id"]) if data.get("video_id") else None
-        if media:
-            file_id = media.file_id
-        elif message.text == "/skip" and existing:
-            file_id, media_type = existing["file_id"], existing["media_type"]
+            if content.numeric_id(raw):
+                season = await asyncio.to_thread(db.get_season_by_number, data["anime_id"], int(raw))
+                if season:
+                    await set_video_location(message, state, season)
+                    return
+            await message.answer("Bunday fasl topilmadi. Fasl raqamini kiriting.")
+            return
+        if step == 9:
+            await message.answer("Saqlash tugmasini bosing yoki orqaga qayting.")
+            return
+        if raw == "/skip" and data.get("video_id") and 1 <= step <= 8:
+            value = data.get(VIDEO_STEPS[step][0])
+        elif raw == "/skip" and 2 <= step <= 7:
+            value = None
+        elif step in (1, 3, 6) and 1 <= len(raw) <= (2500 if step == 6 else 100):
+            value = raw
+        elif step == 2 and content.numeric_id(raw) and 0 < int(raw) <= 2147483647:
+            value = int(raw)
+        elif step == 4 and (country := content.normalize_country(raw)):
+            value = country
+        elif step == 5 and content.numeric_id(raw) and 1900 <= int(raw) <= 2100:
+            value = int(raw)
+        elif step == 7 and message.photo:
+            value = message.photo[-1].file_id
+        elif step == 8 and (media := content.pick_media(message))[0]:
+            value = media[0].file_id
+            await state.update_data(media_type=media[1])
         else:
-            await message.answer("Videoni yuboring.")
+            await message.answer("Kiritilgan qiymat mos kelmadi.")
+            await video_step(message, state, step)
             return
-        try:
-            saved = store.save_video(**data, file_id=file_id, media_type=media_type)
-        except db.INTEGRITY_ERRORS:
-            await state.set_state(ExtrasForm.video)
-            await message.answer("Bu tartib raqami band. Raqam, nom va tavsifni qayta yuboring.")
-            return
-        await state.clear()
-        await message.answer("Video saqlandi." if saved else "Kontent topilmadi.", reply_markup=content.buttons(
-            (("📋 Kontent", f"x_manageanime_{data['anime_id']}_0"),),
-            (("📢 E’lonni ko‘rib chiqish", f"p_admin_post_{data['anime_id']}"),)))
+        await state.update_data({VIDEO_STEPS[step][0]: value})
+        await video_step(message, state, step + 1)
 
     @router.callback_query(F.data.regexp(r"^x_caption_[0-9]{1,18}$"))
     async def caption_start(callback, state):
@@ -491,10 +635,19 @@ def install(router, admin_id, channel, is_subscribed, add_anime):
     async def statistics(callback):
         if not await owner(callback):
             return
-        users, metrics, opened, episodes = store.owner_statistics()
-        rows = ["📊 Bot statistikasi", f"Jami foydalanuvchilar: {users[0]}", f"Bugun faol (UTC): {users[1]}"]
-        rows.extend(f"{label}: {metrics.get(key, 0)}" for key, label in
-                    (("film", "Yuborilgan filmlar"), ("ova", "Yuborilgan OVA"), ("search", "Qidiruvlar"), ("error", "Xatolar")))
+        users, metrics, opened, episodes = await asyncio.to_thread(store.owner_statistics)
+        rows = ["📊 AniVrum statistikasi", f"👥 Hisobda saqlangan foydalanuvchilar: {users[0]}",
+                f"🟢 Bugun faol (Toshkent vaqti): {users[1]}",
+                f"📅 Oxirgi 7 kunda faol: {metrics['active_7']}",
+                f"📅 Oxirgi 30 kunda faol: {metrics['active_30']}", ""]
+        rows.extend(f"{label}: {metrics.get(key, 0)}" for key, label in (
+            ("anime_count", "🎬 Animelar"), ("season_count", "📺 Fasllar"),
+            ("episode_count", "▶️ Qismlar"), ("film_count", "🎞 Filmlar"), ("ova_count", "⭐ OVA"),
+            ("episode_sent", "📤 Yuborilgan qismlar"), ("film", "📤 Yuborilgan filmlar"),
+            ("ova", "📤 Yuborilgan OVA"), ("search", "🔎 Qidiruvlar"), ("error", "⚠️ Qayd etilgan xatolar"),
+        ))
+        sent = sum(metrics.get(key, 0) for key in ("episode_sent", "film", "ova"))
+        rows.append(f"📤 Jami yuborilgan videolar: {sent}")
         rows.append("\nEng ko‘p ochilgan animelar")
         rows.extend(f"{item['title']} · {item['total']}" for item in opened)
         if not opened:
@@ -504,4 +657,8 @@ def install(router, admin_id, channel, is_subscribed, add_anime):
                     for item in episodes)
         if not episodes:
             rows.append("Ma’lumot yo‘q.")
+        if metrics.get("busiest_hours"):
+            rows.append("\nEng ko‘p qism yuborilgan soatlar (Toshkent vaqti)")
+            rows.extend(f"{hour:02d}:00–{hour:02d}:59 · {count} ta qism"
+                        for hour, count in metrics["busiest_hours"])
         await callback.message.answer("\n".join(rows), parse_mode=None)

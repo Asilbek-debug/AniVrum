@@ -13,7 +13,8 @@ from aiogram.exceptions import (
     TelegramAPIError, TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter,
 )
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+from aiogram.filters import StateFilter
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from database import db
@@ -37,6 +38,7 @@ class ContentForm(StatesGroup):
     reconcile = State()
     channel_post = State()
     channel_confirm = State()
+    admin_catalog_search = State()
 
 
 def navigation_group(text):
@@ -49,6 +51,8 @@ def navigation_group(text):
 
 def button(*, text, callback_data=None, url=None, style=None):
     action = callback_data or ""
+    if style is None and action.startswith(("v5_anime_cancel_", "xv_cancel_")):
+        style = "danger"
     if style is None and not navigation_group(text):
         if action.startswith((
             "manage_delete_", "manage_confirmdelete_", "season_delete_", "season_confirmdelete_",
@@ -61,7 +65,7 @@ def button(*, text, callback_data=None, url=None, style=None):
         elif action.startswith((
             "admin_add_", "addseason_", "p_fav_add_", "x_add_", "x_newnews_0",
             "p_admin_publish_", "p_admin_repost_", "x_postnews_", "p_channel_send_",
-            "check_subscription", "p_admin_update_", "privacy_allow",
+            "check_subscription", "p_admin_update_", "privacy_allow", "xv_save_",
         )):
             style = "success"
         elif action in {
@@ -79,7 +83,7 @@ def button(*, text, callback_data=None, url=None, style=None):
             "p_admin_askupdate_", "p_admin_askrepost_", "p_compose_menu",
             "x_manage", "x_caption_", "x_editvideo_", "x_news_", "x_adminnews_", "x_asknews_",
             "x_comments_", "x_comment_", "x_viewcomment_", "x_stats", "x_editnews_", "x_newnews_",
-            "p_cat_", "p_repeat_", "p_desc_", "activity_",
+            "p_cat_", "p_repeat_", "p_desc_", "activity_", "p_admin_group_", "x_independent_",
         )) or text.startswith(("Keyingi faslni", "🔗 Kanalga obuna")):
             style = "primary"
     return InlineKeyboardButton(text=text, callback_data=callback_data, url=url, style=style)
@@ -132,13 +136,15 @@ def pick_media(message):
     return None, None
 
 
-async def send_media(bot, chat_id, file_id, media_type, caption, *, protect_content, retry=True):
+async def send_media(bot, chat_id, file_id, media_type, caption, *, protect_content, retry=True, cover=None):
     if media_type == "document":
         method = bot.send_document
         fields = {"document": file_id}
     else:
         method = bot.send_video
         fields = {"video": file_id}
+        if cover:
+            fields["cover"] = cover
     try:
         return await method(chat_id=chat_id, caption=caption, parse_mode=None, protect_content=protect_content, **fields)
     except TelegramRetryAfter as error:
@@ -197,7 +203,7 @@ def truncate_caption(value, units):
     return prefix.rstrip() + "…"
 
 
-def caption(item, suffix=""):
+def caption(item, suffix="", *, admin_status=(), show_counts=False):
     header = f"🎬 {BRAND_NAME.upper()}"
     title = limited(" ".join(item["title"].split()).upper(), 100)
     rows = [(icon, label, value) for icon, label, value in (
@@ -205,14 +211,15 @@ def caption(item, suffix=""):
         ("🌍", "Davlat", limited((item["country"] or "").strip(), 100)),
         ("📅", "Yil", str(item["release_year"] or "")),
     ) if value]
-    if item["season_count"]:
+    if item["season_count"] or show_counts or admin_status:
         rows.extend([("📺", "Fasllar", f"{item['season_count']} ta"),
                      ("🎞", "Qismlar", f"{item['episode_count']} ta")])
     keys = item.keys()
     for key, icon, label in (("film_count", "🎞", "Filmlar"), ("ova_count", "⭐", "OVA")):
-        if key in keys and item[key]:
+        if key in keys and (item[key] or show_counts or admin_status):
             rows.append((icon, label, f"{item[key]} ta"))
     rows.append(("🔢", "Kod", limited(item["code"], 58)))
+    rows.extend(admin_status)
     description = " ".join((item["description"] or "").split())
     description_header = f"\n\n📖 QISQACHA TAVSIF\n\n" if description else ""
     footer = f"\n\n{DIVIDER}\n📢 @AniVrum{suffix}"
@@ -248,30 +255,30 @@ def video_caption(item, season_number=None, episode_number=None, standalone=None
     return truncate_caption(text, PHOTO_CAPTION_LIMIT) or None
 
 
-def content_link(text, payload):
-    return button(text=text, url=f"https://t.me/AniVrum_bot?start={payload}", style="primary")
+def layout_button(entry, index, *, solitary=False):
+    kind = entry["kind"]
+    if kind == "season":
+        markers = ("🔹", "🔸", "🔷", "🔶")
+        label = f"📺 {entry['number']}-fasl {markers[index % len(markers)]}"
+        target = "numbered_parts"
+    else:
+        icon = "🎬 Film" if kind == "film" else "🟣 ⭐ OVA"
+        label = "▶️ Filmni ko‘rish" if solitary and kind == "film" else f"{icon} · {limited(entry['title'], 42)}"
+        target = "x_video"
+    return button(text=label, callback_data=f"{target}_{entry['id']}")
 
 
 def announcement_rows(anime_id, page=0):
     items = store.announcement_entries(anime_id, page * ANNOUNCEMENT_PAGE_SIZE, ANNOUNCEMENT_PAGE_SIZE + 1)
-    rows = []
-    for entry in items[:ANNOUNCEMENT_PAGE_SIZE]:
-        kind = entry["kind"]
-        if kind == "season":
-            label, target = f"{entry['number']}-fasl", "season"
-        else:
-            label = f"{'Film' if kind == 'film' else 'OVA'} — {limited(entry['title'], 50)}"
-            target = "extra"
-        rows.append([content_link(label, f"{target}_{entry['id']}")])
+    rows = [[layout_button(entry, page * ANNOUNCEMENT_PAGE_SIZE + index)]
+            for index, entry in enumerate(items[:ANNOUNCEMENT_PAGE_SIZE])]
     return rows, len(items) > ANNOUNCEMENT_PAGE_SIZE
 
 
 def channel_keyboard(item):
-    rows, more = announcement_rows(item["id"])
-    rows.insert(0, [content_link("📥 YUKLAB OLISH", f"animeid_{item['id']}")])
-    if more:
-        rows.append([content_link("Barcha fasllar, filmlar va OVA", f"catalog_{item['id']}")])
-    return keyboard_markup(rows)
+    download = button(text="📥 YUKLAB OLISH", style="success",
+                      url=f"https://t.me/AniVrum_bot?start=animeid_{item['id']}")
+    return keyboard_markup([[download]])
 
 
 def detail_buttons(item, user_id):
@@ -282,13 +289,6 @@ def detail_buttons(item, user_id):
     ]
     if not item["season_count"]:
         actions.clear()
-    standalone = store.standalone_videos(anime_id, limit=9)
-    for video in standalone[:8]:
-        icon = "🎞" if video["kind"] == "film" else "⭐"
-        actions.append(((f"{icon} {video['number']} ? {limited(video['title'], 42)}",
-                         f"x_video_{video['id']}"),))
-    if len(standalone) > 8:
-        actions.append((("🎞 Barcha film va OVA", f"x_videos_{anime_id}_0"),))
     actions.append((("💬 Anime haqida izoh qoldirish", f"x_comment_{anime_id}"),))
     back = "anime_az"
     if db.is_favorite(user_id, anime_id):
@@ -298,22 +298,32 @@ def detail_buttons(item, user_id):
     description = item["description"] or ""
     if len(description) > CAPTION_DESCRIPTION_LENGTH or caption_units(description) > 320:
         actions.append((("To‘liq tavsif", f"p_desc_{anime_id}"),))
-    return buttons(*actions, (favorite,), (("Sevimlilarim", "favorites"), ("⬅️ Orqaga", back)))
+    entries = store.announcement_entries(anime_id, 0, 13)
+    layout = [[layout_button(entry, index, solitary=len(entries) == 1)]
+              for index, entry in enumerate(entries[:12])]
+    if len(entries) > 12:
+        layout.append([button(text="Barcha fasllar, filmlar va OVA", callback_data=f"content_page_{anime_id}_0")])
+    primary = buttons(*actions, (favorite,)).inline_keyboard
+    navigation = buttons((("Sevimlilarim", "favorites"), ("⬅️ Orqaga", back))).inline_keyboard
+    return InlineKeyboardMarkup(inline_keyboard=[*primary, *layout, *navigation])
 
 
 async def show_detail(message, user_id, anime_id, replace=False, *, protect_content=True, actor=None):
-    item = store.anime_content(anime_id)
+    clock = asyncio.get_running_loop().time
+    started = clock()
+    item = await asyncio.to_thread(store.anime_content, anime_id)
     if not item or not item["visible"]:
         await message.answer("Kontent topilmadi.")
         return
     try:
-        store.metric("open", anime_id)
+        await asyncio.to_thread(store.metric, "open", anime_id)
     except db.DATABASE_ERRORS:
         log.warning("Anime ochilishi statistikaga yozilmadi.")
-    markup = detail_buttons(item, user_id)
+    markup = await asyncio.to_thread(detail_buttons, item, user_id)
     suffix = f"\n\nYuborilgan videolar: {item['views']}"
     await show_content(message, item, caption(item, suffix=suffix), markup, replace,
                        protect_content=protect_content)
+    log.info("Anime menyusi: %.1f ms", (clock() - started) * 1000)
     await activity.observe(message, user_id, "anime", "anime", anime_id, actor=actor)
 
 
@@ -341,9 +351,9 @@ async def publish(bot, channel, anime_id, previous_post=None):
     try:
         options = dict(parse_mode="HTML", reply_markup=channel_keyboard(item), protect_content=False)
         if item["poster_file_id"]:
-            post = await bot.send_photo(channel, item["poster_file_id"], caption=caption(item), **options)
+            post = await bot.send_photo(channel, item["poster_file_id"], caption=caption(item, show_counts=True), **options)
         else:
-            post = await bot.send_message(channel, caption(item), **options)
+            post = await bot.send_message(channel, caption(item, show_counts=True), **options)
     except (TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter):
         if previous_post is None:
             store.finish_announcement(anime_id, "failed")
@@ -361,16 +371,34 @@ async def publish(bot, channel, anime_id, previous_post=None):
 
 def admin_menu(*, include_activity=False):
     return buttons(
-        (("➕ Anime qo‘shish", "admin_add_anime"), ("➕ Fasl qo‘shish", "admin_add_season")),
-        (("🎞 Film / ⭐ OVA", "x_manage_0"), ("📰 Anime yangiliklari", "x_adminnews_0")),
-        (("💬 Izohlar", "x_comments_0"), ("📊 Bot statistikasi", "x_stats")),
-        (("📋 Kontent", "p_admin_list_manage_0"), ("📺 Fasllar", "p_admin_list_seasons_0")),
-        (("▶️ Qismlar", "p_admin_list_parts_0"), ("🖼 Posterlar", "p_admin_list_poster_0")),
-        (("📢 E’lonlar", "p_admin_list_post_0"), ("📊 Statistika", "p_admin_stats")),
-        (("📤 Kanalga post yuborish", "p_compose_menu"),),
-        (("⚙️ Sozlamalar", "p_admin_settings"),),
+        (("📚 Katalog", "p_admin_group_catalog"), ("📢 Kanal", "p_admin_group_channel")),
+        (("📊 Statistika", "p_admin_group_statistics"), ("👥 Foydalanuvchilar", "p_admin_group_users")),
+        (("⚙️ Sozlamalar", "p_admin_group_settings"),),
+        (("📚 Animelar katalogi", "p_admin_catalogreset"),),
         *(((("👥 Foydalanuvchilar nazorati", "activity_home"),),) if include_activity else ()),
     )
+
+
+ADMIN_GROUPS = {
+    "catalog": ("📚 Katalog", (
+        (("📚 Animelar katalogi", "p_admin_catalogreset"), ("➕ Anime qo‘shish", "admin_add_anime")),
+        (("📺 Fasllar", "p_admin_list_seasons_0"), ("➕ Fasl qo‘shish", "admin_add_season")),
+        (("▶️ Qismlar", "p_admin_list_parts_0"), ("🎬 Filmlar va OVA", "x_manage_0")),
+        (("🖼 Posterlar", "p_admin_list_poster_0"),),
+    )),
+    "channel": ("📢 Kanal", (
+        (("📤 Kanalga post yuborish", "p_compose_menu"),),
+        (("📰 Anime yangiliklari", "x_adminnews_0"), ("📢 E’lonlar va postni yangilash", "p_admin_list_post_0")),
+    )),
+    "statistics": ("📊 Statistika", (
+        (("📊 Umumiy va kontent statistikasi", "x_stats"),),
+        (("📤 Video yuborish statistikasi", "p_admin_stats"),),
+    )),
+    "users": ("👥 Foydalanuvchilar", ((("💬 Izohlar", "x_comments_0"),),)),
+    "settings": ("⚙️ Sozlamalar", (
+        (("⚙️ Bot sozlamalari", "p_admin_settings"), ("🔒 Kontent holati", "p_admin_catalogreset")),
+    )),
+}
 
 
 async def send_channel_post(bot, chat_id, draft, reply_markup=None):
@@ -522,7 +550,7 @@ def install(router: Router, admin_id, channel, is_subscribed, add_anime_state):
             "sent": "Kanalga yangi post yuborildi.",
             "failed": "Telegram yangi postni qabul qilmadi. Poster va botning kanal huquqlarini tekshiring.",
             "sending": "Yuborish natijasi noma’lum. Qayta urinishdan oldin kanalni qo‘lda tekshiring.",
-            "incomplete": "E’lon uchun yaroqli kod, poster va video kerak.",
+            "incomplete": "E’lon uchun yaroqli kod va kamida bitta video kerak.",
             "stale": "E’lon holati o‘zgargan. E’lonlar bo‘limini qayta oching.",
         }[status]
         await callback.message.answer(outcome, reply_markup=buttons(
@@ -641,6 +669,14 @@ def install(router: Router, admin_id, channel, is_subscribed, add_anime_state):
                         reply_markup=buttons(*rows))
         await activity.observe_callback(callback, "catalog")
 
+    @router.callback_query(F.data == "v5_anime_skip_6", StateFilter(ContentForm.poster))
+    async def skip_poster(callback, state):
+        if callback.from_user.id != admin_id() or not isinstance(callback.message, Message):
+            await callback.answer("Ruxsat yo‘q.", show_alert=True)
+            return
+        await callback.answer()
+        await accept_draft_poster(callback.message, state, None)
+
     @router.message(ContentForm.poster)
     async def add_poster(message, state):
         if message.from_user.id != admin_id():
@@ -649,13 +685,19 @@ def install(router: Router, admin_id, channel, is_subscribed, add_anime_state):
             await message.answer("Posterni rasm shaklida yuboring yoki /skip yuboring.")
             return
         poster = message.photo[-1].file_id if message.photo else None
+        await accept_draft_poster(message, state, poster)
+
+    async def accept_draft_poster(message, state, poster):
         data = await state.get_data()
         if data.get("initial_video"):
             await create_draft(message, state, data, poster, 0)
             return
         await state.update_data(poster=poster)
         await state.set_state(ContentForm.seasons)
-        await message.answer("Fasllar sonini kiriting (1–99).")
+        await message.answer("Fasllar sonini kiriting (0–99). Keyin qo‘shish uchun /skip.", reply_markup=buttons(
+            (("⏭ O‘tkazib yuborish", "v5_anime_skip_7"),),
+            (("⬅️ Orqaga", "v5_anime_back_7"), ("❌ Bekor qilish", "v5_anime_cancel_7")),
+        ))
 
     async def create_draft(message, state, data, poster, seasons):
         try:
@@ -672,6 +714,8 @@ def install(router: Router, admin_id, channel, is_subscribed, add_anime_state):
             return
         rows = [( (f"📥 {season['season_number']}-faslga video yuklash", f"uploadseason_{season['id']}"), )
                 for season in db.get_anime_seasons(anime_id)[:10]]
+        if not seasons:
+            rows.append((("➕ Fasl qo‘shish", f"addseason_{anime_id}"), ("🎬 Film va OVA", f"x_manageanime_{anime_id}_0")))
         await message.answer("Qoralama saqlandi. Fasllarga qismlarni yuklang.",
                              reply_markup=buttons(*rows, (("Barcha fasllar", f"p_admin_upload_{anime_id}"),),
                                                   (("E’lonni ko‘rib chiqish", f"p_admin_post_{anime_id}"),)))
@@ -681,11 +725,22 @@ def install(router: Router, admin_id, channel, is_subscribed, add_anime_state):
         if message.from_user.id != admin_id():
             return
         value = message.text or ""
-        if not value.isascii() or not value.isdigit() or len(value) > 2 or not int(value):
-            await message.answer("1 dan 99 gacha fasl sonini kiriting.")
+        if value == "/skip":
+            value = "0"
+        if not value.isascii() or not value.isdigit() or len(value) > 2:
+            await message.answer("0 dan 99 gacha fasl sonini kiriting.")
             return
         data = await state.get_data()
         await create_draft(message, state, data, data["poster"], int(value))
+
+    @router.callback_query(F.data == "v5_anime_skip_7", StateFilter(ContentForm.seasons))
+    async def skip_seasons(callback, state):
+        if callback.from_user.id != admin_id() or not isinstance(callback.message, Message):
+            await callback.answer("Ruxsat yo‘q.", show_alert=True)
+            return
+        await callback.answer()
+        data = await state.get_data()
+        await create_draft(callback.message, state, data, data["poster"], 0)
 
     @router.message(ContentForm.edit_media)
     async def save_media(message, state):
@@ -717,12 +772,62 @@ def install(router: Router, admin_id, channel, is_subscribed, add_anime_state):
         await message.answer("Post ID saqlandi." if changed else "E’lon holati o‘zgargan.",
                              reply_markup=buttons((("E’lon holati", f"p_admin_post_{anime_id}"),)))
 
+    async def catalog_page(message, page, query="", *, replace=False):
+        items = await asyncio.to_thread(store.admin_catalog, query, page * PAGE_SIZE, PAGE_SIZE + 1)
+        rows = [((f"{limited(item['title'], 48)} · {item['code']} · "
+                  f"{'Ochiq' if item['visible'] else 'Yopiq'}", f"manage_anime_{item['id']}"),)
+                for item in items[:PAGE_SIZE]]
+        if page:
+            rows.append((("⬅️ Oldingi", f"p_admin_list_manage_{page - 1}"),))
+        if len(items) > PAGE_SIZE:
+            rows.append((("Keyingi ➡️", f"p_admin_list_manage_{page + 1}"),))
+        rows.append((("🔎 Nom yoki kod bilan qidirish", "p_admin_catalogsearch"),))
+        if query:
+            rows.append((("Barcha animelar", "p_admin_catalogreset"),))
+        rows.append((("⬅️ Admin panel", "p_admin_home"),))
+        title = "📚 Animelar katalogi" if items else "Anime topilmadi."
+        if replace:
+            await edit_text(message, title, reply_markup=buttons(*rows))
+        else:
+            await message.answer(title, reply_markup=buttons(*rows))
+
+    @router.message(ContentForm.admin_catalog_search, F.text)
+    async def search_admin_catalog(message, state):
+        if message.from_user.id != admin_id():
+            return
+        query = message.text.strip()
+        if not 1 <= len(query) <= 100:
+            await message.answer("Nom yoki kodni 1–100 belgi oralig‘ida kiriting.")
+            return
+        await state.set_state(None)
+        await state.update_data(admin_catalog_query=query)
+        await catalog_page(message, 0, query)
+
     @router.callback_query(F.data.regexp(r"^p_admin_[a-z_0-9]+$"))
     async def admin(callback, state, bot):
         if callback.from_user.id != admin_id():
             await callback.answer("Bu bo‘lim administrator uchun.", show_alert=True)
             return
         action = callback.data.removeprefix("p_admin_")
+        if action.startswith("group_") and action[6:] in ADMIN_GROUPS:
+            title, rows = ADMIN_GROUPS[action[6:]]
+            if action == "group_users" and activity.enabled() and activity.private(callback.message, callback.from_user.id):
+                rows += ((("👥 Foydalanuvchilar nazorati", "activity_home"),),)
+            await callback.answer()
+            await edit_text(callback.message, title,
+                            reply_markup=buttons(*rows, (("⬅️ Admin panel", "p_admin_home"),)))
+            return
+        if action == "catalogsearch":
+            await state.set_state(ContentForm.admin_catalog_search)
+            await callback.answer()
+            await callback.message.answer("Anime nomini yoki kodini kiriting.")
+            return
+        if action == "catalogreset":
+            await state.set_state(None)
+            await state.update_data(admin_catalog_query="")
+            await callback.answer()
+            await catalog_page(callback.message, 0, replace=True)
+            return
         if action == "home":
             await callback.answer()
             await callback.message.answer(f"{BRAND_NAME} · Admin panel", reply_markup=admin_menu(
@@ -730,11 +835,11 @@ def install(router: Router, admin_id, channel, is_subscribed, add_anime_state):
             ))
             return
         if action == "stats":
-            periods, popular, favorite, season = store.statistics()
+            periods, popular, favorite, season = await asyncio.to_thread(store.statistics)
             text = f"{BRAND_NAME} · Video yuborish statistikasi\n\n"
             for days, label in ((0, "Umumiy"), (7, "Oxirgi 7 kun"), (30, "Oxirgi 30 kun")):
                 row = periods[days]
-                text += f"{label}: {row['total']} yuborish · {row['users']} noyob foydalanuvchi\n"
+                text += f"{label}: {row['total']} ta qism {row['users']} nafar foydalanuvchiga yuborilgan.\n"
             for label, row in (("Eng mashhur anime", popular), ("Eng ko‘p saqlangan anime", favorite),
                                ("Eng ko‘p so‘ralgan fasl", season)):
                 text += f"\n{label}: {limited(row['title'], 100) if row else '—'}"
@@ -768,6 +873,11 @@ def install(router: Router, admin_id, channel, is_subscribed, add_anime_state):
             page = int(raw_page)
             if page > 1_000_000:
                 await callback.answer("Sahifa topilmadi.", show_alert=True)
+                return
+            if mode == "manage":
+                await callback.answer()
+                data = await state.get_data()
+                await catalog_page(callback.message, page, data.get("admin_catalog_query", ""), replace=True)
                 return
             with store.connection() as conn:
                 items = conn.execute("""SELECT id,title,visible FROM animes
@@ -860,21 +970,22 @@ def install(router: Router, admin_id, channel, is_subscribed, add_anime_state):
                     chat_id = int(chat_id)
                 message_id = record["message_id"]
                 poster = item["poster_file_id"]
-                new_caption = caption(item)
+                replace_media = bool(poster and (record["is_text"] or poster != record["poster_file_id"]))
+                new_caption = caption(item, show_counts=True)
                 markup = channel_keyboard(item)
                 try:
-                    if record["is_text"]:
-                        await bot.edit_message_text(
-                            chat_id=chat_id, message_id=message_id, text=new_caption,
-                            parse_mode="HTML", reply_markup=markup,
-                        )
-                    elif poster and poster != record["poster_file_id"]:
+                    if replace_media:
                         await bot.edit_message_media(
                             chat_id=chat_id, message_id=message_id,
                             media=InputMediaPhoto(media=poster, caption=new_caption, parse_mode="HTML"),
                             reply_markup=markup,
                         )
                         store.remember_announcement_poster(anime_id, message_id, poster)
+                    elif record["is_text"]:
+                        await bot.edit_message_text(
+                            chat_id=chat_id, message_id=message_id, text=new_caption,
+                            parse_mode="HTML", reply_markup=markup,
+                        )
                     else:
                         await bot.edit_message_caption(
                             chat_id=chat_id, message_id=message_id, caption=new_caption,
@@ -884,7 +995,7 @@ def install(router: Router, admin_id, channel, is_subscribed, add_anime_state):
                 except TelegramBadRequest as error:
                     error_text = error.message.lower().strip()
                     if "message is not modified" in error_text:
-                        if poster and not record["is_text"]:
+                        if replace_media:
                             store.remember_announcement_poster(anime_id, message_id, poster)
                         outcome = "Kanal e’loni dolzarb."
                     elif error_text.split(": ")[-1] in ("message to edit not found", "message not found"):
@@ -982,7 +1093,7 @@ def install(router: Router, admin_id, channel, is_subscribed, add_anime_state):
             else:
                 suffix += "\nTasdiqlash bilan kontentni tarqatish huquqini tasdiqlaysiz."
                 rows.append((("✅ Tasdiqlash va e’lon qilish", f"p_admin_publish_{anime_id}"),))
-            text = caption(item, suffix=suffix)
+            text = caption(item, suffix=suffix, show_counts=name == "post")
             rows.append((("▶️ Fasllar va videolar", f"p_admin_upload_{anime_id}"),))
         else:
             await callback.answer("Tugma eskirgan.", show_alert=True)

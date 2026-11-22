@@ -2,10 +2,13 @@
 
 import os
 import sqlite3
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
+from pathlib import Path
 
 from database import postgres
 from database.db import connection, lock_writes, title_order
+
+TASHKENT = timezone(timedelta(hours=5), "Asia/Tashkent")
 
 
 def migrate():
@@ -59,6 +62,10 @@ def migrate_sqlite(conn):
         ):
             conn.execute(statement)
         conn.execute("PRAGMA user_version = 4")
+    if not any(row[1] == "sort_order" for row in conn.execute("PRAGMA table_info(seasons)")):
+        for statement in Path(__file__).with_name("catalog_layout.sql").read_text(encoding="utf-8").split(";"):
+            if statement.strip():
+                conn.execute(statement)
 
 
 def _migrate_v1(conn):
@@ -135,6 +142,35 @@ def _content(conn, anime_id):
             (SELECT COUNT(*) FROM anime_views WHERE anime_id=a.id) AS views
         FROM animes a WHERE a.id=?
     """, (anime_id,)).fetchone()
+
+
+def code_exists(code):
+    with connection() as conn:
+        return conn.execute("SELECT 1 FROM animes WHERE code=?", (code,)).fetchone() is not None
+
+
+def admin_catalog(query, offset, limit):
+    pattern = "%" + query.replace("!", "!!").replace("%", "!%").replace("_", "!_") + "%"
+    with connection() as conn:
+        order = title_order(conn)
+        return conn.execute(f"""SELECT id, title, code, visible FROM animes a
+            WHERE kind='anime' AND (LOWER(title) LIKE LOWER(?) ESCAPE '!' OR code=?)
+            ORDER BY {order}, id LIMIT ? OFFSET ?""", (pattern, query, limit, offset)).fetchall()
+
+
+def independent_catalog(offset, limit):
+    with connection() as conn:
+        order = title_order(conn)
+        return conn.execute(f"""SELECT a.id,a.title FROM animes a WHERE a.kind='anime' AND a.visible=1
+            AND NOT EXISTS (SELECT 1 FROM seasons WHERE anime_id=a.id)
+            AND EXISTS (SELECT 1 FROM standalone_videos WHERE anime_id=a.id)
+            ORDER BY {order}, a.id LIMIT ? OFFSET ?""", (limit, offset)).fetchall()
+
+
+def set_visibility(anime_id, visible):
+    with connection() as conn:
+        return conn.execute("UPDATE animes SET visible=? WHERE id=? AND kind='anime'",
+                            (int(visible), anime_id)).rowcount
 
 
 def by_code(code, kind):
@@ -250,7 +286,7 @@ def finish_announcement(anime_id, status, chat_id=None, message_id=None, poster_
 
 def remember_announcement_poster(anime_id, message_id, poster_file_id):
     with connection() as conn:
-        conn.execute("""UPDATE announcements SET poster_file_id=?
+        conn.execute("""UPDATE announcements SET poster_file_id=?, is_text=0
             WHERE anime_id=? AND message_id=? AND status='sent'""", (poster_file_id, anime_id, message_id))
 
 
@@ -281,16 +317,73 @@ def statistics():
 
 def announcement_entries(anime_id, offset, limit):
     with connection() as conn:
-        return conn.execute("""SELECT id, number, kind, title FROM (
-            SELECT s.id, s.season_number AS number, 0 AS sort_order, 'season' AS kind, '' AS title
-            FROM seasons s WHERE s.anime_id=? AND EXISTS (
-                SELECT 1 FROM episodes e WHERE e.season_id=s.id AND e.video_file_id <> ''
-            )
-            UNION ALL
-            SELECT id, number, CASE WHEN kind='film' THEN 1 ELSE 2 END, kind, title
-            FROM standalone_videos WHERE anime_id=? AND file_id <> ''
-        ) entries ORDER BY sort_order, number, id LIMIT ? OFFSET ?""",
-                            (anime_id, anime_id, limit, offset)).fetchall()
+        return layout_entries(conn, anime_id, offset=offset, limit=limit)
+
+
+LAYOUT_TABLES = {"season": "seasons", "episode": "episodes", "film": "standalone_videos", "ova": "standalone_videos"}
+
+
+def layout_entries(conn, anime_id, season_id=None, *, offset=0, limit=None):
+    if season_id is None:
+        base = """SELECT id, season_number AS number, 'season' AS kind, '' AS title, sort_order
+                  FROM seasons WHERE anime_id=?"""
+        extra_filter, parent = "season_id IS NULL", anime_id
+    else:
+        base = """SELECT id, episode_number AS number, 'episode' AS kind, title, sort_order
+                  FROM episodes WHERE season_id=? AND video_file_id<>''"""
+        extra_filter, parent = "season_id=?", season_id
+    query = f"""WITH entries AS (
+        {base}
+        UNION ALL
+        SELECT id, number, kind, title, sort_order FROM standalone_videos
+        WHERE anime_id=? AND {extra_filter}
+    )
+    SELECT id, number, kind, title FROM entries
+    ORDER BY CASE WHEN sort_order IS NULL THEN 1 ELSE 0 END, sort_order,
+        CASE kind WHEN 'film' THEN 1 WHEN 'ova' THEN 2 ELSE 0 END, number, id"""
+    params = [parent, anime_id]
+    if season_id is not None:
+        params.append(season_id)
+    if limit is not None:
+        query += " LIMIT ? OFFSET ?"
+        params.extend((limit, offset))
+    return conn.execute(query, params).fetchall()
+
+
+def season_layout(anime_id, season_id, *, offset=0, limit=None):
+    with connection() as conn:
+        return layout_entries(conn, anime_id, season_id, offset=offset, limit=limit)
+
+
+def reorder_layout(anime_id, season_id, kind, item_id, direction):
+    with connection() as conn:
+        lock_writes(conn, "episodes", "seasons", "standalone_videos")
+        if season_id is not None and not conn.execute(
+                "SELECT 1 FROM seasons WHERE id=? AND anime_id=?", (season_id, anime_id)).fetchone():
+            return False
+        items = layout_entries(conn, anime_id, season_id)
+        keys = [(row["kind"], row["id"]) for row in items]
+        if (kind, item_id) not in keys:
+            return False
+        index = keys.index((kind, item_id))
+        adjacent = index + direction
+        if direction not in (-1, 1) or not 0 <= adjacent < len(keys):
+            return False
+        keys[index], keys[adjacent] = keys[adjacent], keys[index]
+        for position, (entry_kind, entry_id) in enumerate(keys, start=1):
+            conn.execute(f"UPDATE {LAYOUT_TABLES[entry_kind]} SET sort_order=? WHERE id=?", (position, entry_id))
+        return True
+
+
+def move_video(video_id, season_id):
+    with connection() as conn:
+        lock_writes(conn, "seasons", "standalone_videos")
+        video = conn.execute("SELECT anime_id FROM standalone_videos WHERE id=?", (video_id,)).fetchone()
+        if not video or (season_id is not None and not conn.execute(
+                "SELECT 1 FROM seasons WHERE id=? AND anime_id=?", (season_id, video["anime_id"])).fetchone()):
+            return False
+        conn.execute("UPDATE standalone_videos SET season_id=?, sort_order=NULL WHERE id=?", (season_id, video_id))
+        return True
 
 
 def standalone_videos(anime_id, offset=0, limit=13):
@@ -304,19 +397,27 @@ def standalone_video(video_id):
         return conn.execute("SELECT * FROM standalone_videos WHERE id=?", (video_id,)).fetchone()
 
 
-def save_video(anime_id, kind, number, title, description, file_id, media_type, video_id=None, release_year=None, country=None, genre=None):
+def save_video(anime_id, kind, number, title, description, file_id, media_type, video_id=None,
+               release_year=None, country=None, genre=None, season_id=None, poster_file_id=None):
     with connection() as conn:
-        lock_writes(conn, "animes", "standalone_videos")
+        lock_writes(conn, "animes", "seasons", "standalone_videos")
         if not conn.execute("SELECT 1 FROM animes WHERE id=? AND kind='anime'", (anime_id,)).fetchone():
             return None
+        if season_id is not None and not conn.execute(
+                "SELECT 1 FROM seasons WHERE id=? AND anime_id=?", (season_id, anime_id)).fetchone():
+            return None
+        if number is None and video_id is None:
+            number = conn.execute("SELECT COALESCE(MAX(number),0)+1 FROM standalone_videos WHERE anime_id=? AND kind=?",
+                                  (anime_id, kind)).fetchone()[0]
         values = (number, title, description, file_id, media_type, release_year, country, genre)
         if video_id is None:
             return conn.execute("""INSERT INTO standalone_videos
-                (number,title,description,file_id,media_type,release_year,country,genre,anime_id,kind)
-                VALUES (?,?,?,?,?,?,?,?,?,?) RETURNING id""", (*values, anime_id, kind)).fetchone()[0]
+                (number,title,description,file_id,media_type,release_year,country,genre,anime_id,kind,season_id,poster_file_id)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id""",
+                                (*values, anime_id, kind, season_id, poster_file_id)).fetchone()[0]
         changed = conn.execute("""UPDATE standalone_videos SET number=?,title=?,description=?,file_id=?,media_type=?,
-            release_year=?,country=?,genre=?
-            WHERE id=? AND anime_id=? AND kind=?""", (*values, video_id, anime_id, kind)).rowcount
+            release_year=?,country=?,genre=?, poster_file_id=COALESCE(?,poster_file_id)
+            WHERE id=? AND anime_id=? AND kind=?""", (*values, poster_file_id, video_id, anime_id, kind)).rowcount
         return video_id if changed else None
 
 
@@ -394,7 +495,7 @@ def metric(kind, subject=0, *, count=1):
 
 def active_user(user_id):
     with connection() as conn:
-        today = datetime.now(UTC).date().isoformat()
+        today = datetime.now(TASHKENT).date().isoformat()
         conn.execute("""INSERT INTO bot_users VALUES(?,?)
             ON CONFLICT(user_id) DO UPDATE SET last_active=excluded.last_active
             WHERE bot_users.last_active<>excluded.last_active""", (user_id, today))
@@ -412,15 +513,34 @@ def prune_statistics():
 
 
 def owner_statistics():
-    prune_statistics()
     with connection() as conn:
+        today = datetime.now(TASHKENT).date()
         users = conn.execute("SELECT COUNT(*), COUNT(CASE WHEN last_active=? THEN 1 END) FROM bot_users",
-                             (datetime.now(UTC).date().isoformat(),)).fetchone()
+                             (today.isoformat(),)).fetchone()
         metrics = dict(conn.execute("SELECT kind,SUM(total) FROM bot_metrics GROUP BY kind"))
+        for days in (7, 30):
+            metrics[f"active_{days}"] = conn.execute("SELECT COUNT(*) FROM bot_users WHERE last_active>=?",
+                                                     ((today - timedelta(days=days - 1)).isoformat(),)).fetchone()[0]
+        counts = conn.execute("""SELECT
+            (SELECT COUNT(*) FROM animes WHERE kind='anime'),
+            (SELECT COUNT(*) FROM seasons),
+            (SELECT COUNT(*) FROM episodes WHERE video_file_id IS NOT NULL AND video_file_id<>''),
+            (SELECT COUNT(*) FROM standalone_videos WHERE kind='film'),
+            (SELECT COUNT(*) FROM standalone_videos WHERE kind='ova'),
+            (SELECT COUNT(*) FROM anime_views WHERE episode_id<>0)""").fetchone()
+        metrics.update(zip(("anime_count", "season_count", "episode_count", "film_count", "ova_count",
+                            "episode_sent"), counts))
         opened = conn.execute("""SELECT a.title,SUM(m.total) AS total FROM bot_metrics m
             JOIN animes a ON a.id=m.subject WHERE m.kind='open'
             GROUP BY a.id ORDER BY total DESC,a.id LIMIT 5""").fetchall()
         episodes = conn.execute("""SELECT a.title,s.season_number,e.episode_number,COUNT(*) AS total
             FROM anime_views v JOIN episodes e ON e.id=v.episode_id JOIN seasons s ON s.id=e.season_id
             JOIN animes a ON a.id=s.anime_id GROUP BY e.id, a.title, s.season_number ORDER BY total DESC,e.id LIMIT 5""").fetchall()
+        if metrics["episode_sent"] >= 24:
+            buckets = conn.execute("""SELECT SUBSTR(viewed_at,12,2), COUNT(*) FROM anime_views
+                WHERE episode_id<>0 GROUP BY SUBSTR(viewed_at,12,2)""").fetchall()
+            local_hours = [((int(hour) + 5) % 24, count) for hour, count in buckets
+                           if hour and len(hour) == 2 and hour.isascii() and hour.isdigit() and int(hour) < 24]
+            if sum(count for _, count in local_hours) >= 24:
+                metrics["busiest_hours"] = sorted(local_hours, key=lambda row: (-row[1], row[0]))[:3]
         return users, metrics, opened, episodes

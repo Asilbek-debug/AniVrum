@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
-from database import activity, catalog, db, import_postgres, postgres
+from database import activity, catalog, db, import_postgres, migrate_catalog_layout, postgres
 
 
 class SnapshotTests(unittest.TestCase):
@@ -96,6 +96,46 @@ class PostgresTests(unittest.TestCase):
         with import_postgres.snapshot(self.path) as (source, version):
             with postgres.connection(self.url) as target:
                 return import_postgres.transfer(source, target), version
+
+    def test_v5_layout_upgrade_preserves_v4_data_and_is_repeatable(self):
+        with postgres.connection(self.url) as conn:
+            conn.execute("CREATE SCHEMA anivrum")
+            sql_path = Path(postgres.__file__).with_name("postgres_v4.sql")
+            conn.execute(sql_path.read_text(encoding="utf-8"))
+            conn.execute("INSERT INTO animes(id,code,title) VALUES (12,'5678','Legacy')")
+            conn.execute("INSERT INTO seasons(id,anime_id,season_number) VALUES (23,12,1)")
+            conn.execute("INSERT INTO episodes(id,season_id,episode_number,video_file_id) VALUES (34,23,1,'ep-file')")
+            conn.execute("""INSERT INTO standalone_videos(id,anime_id,kind,number,title,file_id,media_type)
+                VALUES (45,12,'film',1,'Film','film-file','video')""")
+            conn.execute("INSERT INTO bot_users VALUES (12345,'2026-01-01')")
+            conn.execute("INSERT INTO bot_metrics VALUES ('2026-01-01','search',0,7)")
+            before = import_postgres.counts(conn)
+        with patch.dict(os.environ, {"DATABASE_URL": self.url}):
+            with self.assertRaisesRegex(RuntimeError, "migrate_catalog_layout"):
+                catalog.migrate()
+            self.assertFalse(migrate_catalog_layout.apply(self.url, check=True))
+            original = postgres.ensure_schema
+
+            def fail_after_ddl(conn):
+                original(conn)
+                raise RuntimeError("simulated failure before commit")
+
+            with patch.object(postgres, "ensure_schema", side_effect=fail_after_ddl):
+                with self.assertRaisesRegex(RuntimeError, "simulated failure"):
+                    migrate_catalog_layout.apply(self.url)
+            self.assertFalse(migrate_catalog_layout.apply(self.url, check=True))
+            self.assertFalse(migrate_catalog_layout.apply(self.url))
+            self.assertTrue(migrate_catalog_layout.apply(self.url))
+            catalog.migrate()
+            self.assertEqual(db.get_episode_by_id(34)["video_file_id"], "ep-file")
+            self.assertEqual(catalog.standalone_video(45)["file_id"], "film-file")
+            self.assertTrue(catalog.move_video(45, 23))
+            self.assertTrue(catalog.reorder_layout(12, 23, "film", 45, -1))
+            self.assertEqual([row["id"] for row in catalog.season_layout(12, 23)], [45, 34])
+        with postgres.connection(self.url) as conn:
+            self.assertEqual(import_postgres.counts(conn), before)
+            self.assertEqual(conn.execute("SELECT * FROM bot_users").fetchone(), (12345, "2026-01-01"))
+            self.assertEqual(conn.execute("SELECT total FROM bot_metrics").fetchone()[0], 7)
 
     def test_activity_additive_migration_preserves_catalog_and_legacy_users(self):
         catalog.migrate()

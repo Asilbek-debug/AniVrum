@@ -48,7 +48,7 @@ from database.db import (
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command, StateFilter
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup
 from aiogram.utils.token import TokenValidationError
 from dotenv import load_dotenv
 from aiogram.exceptions import TelegramAPIError
@@ -214,12 +214,13 @@ def anime_keyboard():
         callback_data="anime_genres"
     ))
     keyboard.add(content.button(text="📅 Yillar", callback_data="anime_years"))
+    keyboard.add(content.button(text="🎬 Mustaqil filmlar va OVA", callback_data="x_independent_0"))
     keyboard.add(content.button(
         text="⬅️ Asosiy menyu",
         callback_data="back_home"
     ))
 
-    keyboard.adjust(2, 2, 1, 1)
+    keyboard.adjust(2, 2, 1, 1, 1)
     return keyboard.as_markup()
 
 
@@ -496,10 +497,60 @@ async def admin_add_anime(callback: CallbackQuery, state: FSMContext):
         "✍️ Anime nomini yuboring yoki kontent turini tanlang:",
         reply_markup=content.buttons((("📺 Anime serial", "x_kind_anime"),
                                       ("🎞 Anime filmi", "x_kind_film"),
-                                      ("⭐ OVA", "x_kind_ova")))
+                                      ("⭐ OVA", "x_kind_ova")),
+                                     (("❌ Bekor qilish", "v5_anime_cancel_0"),))
     )
 
     await callback.answer()
+
+
+ANIME_FORM_STEPS = (
+    (AddAnime.title, "🎬 Anime nomini yuboring."),
+    (AddAnime.code, "🔢 Anime kodini yuboring."),
+    (AddAnime.genre, "🎭 Anime janrini yuboring."),
+    (AddAnime.country, "🌍 Davlatini kiriting. Masalan: Yaponiya"),
+    (AddAnime.release_year, "📅 Chiqarilgan yilini kiriting."),
+    (AddAnime.description, "📝 Anime tavsifini kiriting."),
+    (content.ContentForm.poster, "🖼 Posterni rasm shaklida yuboring."),
+    (content.ContentForm.seasons, "📺 Fasllar sonini yuboring."),
+)
+ANIME_OPTIONAL_FIELDS = {2: "genre", 3: "country", 4: "release_year", 5: "description"}
+
+
+async def prompt_anime_step(message, state, index, *, prefix=""):
+    step, prompt = ANIME_FORM_STEPS[index]
+    await state.set_state(step)
+    rows = []
+    if index in ANIME_OPTIONAL_FIELDS or index == 6:
+        rows.append([content.button(text="⏭ O‘tkazib yuborish", callback_data=f"v5_anime_skip_{index}")])
+        prompt += " O‘tkazish uchun /skip."
+    navigation = []
+    if index:
+        navigation.append(content.button(text="⬅️ Orqaga", callback_data=f"v5_anime_back_{index}"))
+    navigation.append(content.button(text="❌ Bekor qilish", callback_data=f"v5_anime_cancel_{index}", style="danger"))
+    rows.append(navigation)
+    await message.answer(prefix + prompt, reply_markup=content.keyboard_markup(rows))
+
+
+@dp.callback_query(F.data.regexp(r"^v5_anime_(?:skip_[2-5]|(?:back|cancel)_[0-7])$"))
+async def anime_form_navigation(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID or not isinstance(callback.message, Message):
+        await callback.answer("Ruxsat yo‘q.", show_alert=True)
+        return
+    _, _, action, raw_index = callback.data.split("_")
+    index = int(raw_index)
+    if await state.get_state() != ANIME_FORM_STEPS[index][0].state:
+        await callback.answer("Bu bosqich tugagan.")
+        return
+    await callback.answer()
+    if action == "cancel":
+        await state.clear()
+        await callback.message.answer("Jarayon bekor qilindi.", reply_markup=content.admin_menu())
+    elif action == "back" and index:
+        await prompt_anime_step(callback.message, state, index - 1)
+    elif action == "skip" and index in ANIME_OPTIONAL_FIELDS:
+        await state.update_data({ANIME_OPTIONAL_FIELDS[index]: None})
+        await prompt_anime_step(callback.message, state, index + 1)
 
 
 # Admin yuborgan anime nomini qabul qilish
@@ -515,13 +566,7 @@ async def receive_anime_title(message: Message, state: FSMContext):
     anime_title = message.text.strip()
 
     await state.update_data(title=anime_title)
-    await state.set_state(AddAnime.code)
-
-    await message.answer(
-        f"✅ Anime nomi: {anime_title}\n\n"
-        "🔢 Endi anime kodini yuboring.\n"
-        "Masalan: 1002"
-    )
+    await prompt_anime_step(message, state, 1, prefix=f"✅ Anime nomi: {anime_title}\n\n")
 
 
 # Anime kodini qabul qilish
@@ -538,15 +583,12 @@ async def receive_anime_code(message: Message, state: FSMContext):
         return
 
     anime_code = message.text.strip()
+    if await asyncio.to_thread(store.code_exists, anime_code):
+        await message.answer("Bu kod band. Boshqa kodni yuboring.")
+        return
 
     await state.update_data(code=anime_code)
-    await state.set_state(AddAnime.genre)
-
-    await message.answer(
-        f"✅ Anime kodi: {anime_code}\n\n"
-        "🎭 Endi anime janrini yuboring.\n"
-        "Masalan: Fantastika, Sarguzasht, Jangari"
-    )
+    await prompt_anime_step(message, state, 2, prefix=f"✅ Anime kodi: {anime_code}\n\n")
 
 
 # Anime janrini qabul qilish
@@ -556,8 +598,7 @@ async def receive_anime_genre(message: Message, state: FSMContext):
         return
     if message.text == "/skip":
         await state.update_data(genre=None)
-        await state.set_state(AddAnime.country)
-        await message.answer("🌍 Davlatini kiriting yoki /skip yuboring.")
+        await prompt_anime_step(message, state, 3)
         return
 
     if not message.text or not message.text.strip():
@@ -567,8 +608,7 @@ async def receive_anime_genre(message: Message, state: FSMContext):
     genre = message.text.strip()
 
     await state.update_data(genre=genre)
-    await state.set_state(AddAnime.country)
-    await message.answer("🌍 Davlatini kiriting yoki /skip yuboring. Masalan: Yaponiya, Xitoy")
+    await prompt_anime_step(message, state, 3)
 
 
 @dp.message(AddAnime.country)
@@ -577,16 +617,14 @@ async def receive_anime_country(message: Message, state: FSMContext):
         return
     if message.text == "/skip":
         await state.update_data(country=None)
-        await state.set_state(AddAnime.release_year)
-        await message.answer("📅 Yilni kiriting yoki /skip yuboring.")
+        await prompt_anime_step(message, state, 4)
         return
     country = content.normalize_country(message.text)
     if country is None:
         await message.answer(content.COUNTRY_HINT)
         return
     await state.update_data(country=country)
-    await state.set_state(AddAnime.release_year)
-    await message.answer("📅 Chiqarilgan yilini yuboring yoki /skip yozing. Masalan: 2025")
+    await prompt_anime_step(message, state, 4)
 
 
 # Anime yilini qabul qilish
@@ -596,8 +634,7 @@ async def receive_anime_year(message: Message, state: FSMContext):
         return
     if message.text == "/skip":
         await state.update_data(release_year=None)
-        await state.set_state(AddAnime.description)
-        await message.answer("📝 Tavsif kiriting yoki /skip yuboring.")
+        await prompt_anime_step(message, state, 5)
         return
 
     if not message.text or not content.numeric_id(message.text.strip()):
@@ -614,12 +651,7 @@ async def receive_anime_year(message: Message, state: FSMContext):
         return
 
     await state.update_data(release_year=year)
-    await state.set_state(AddAnime.description)
-
-    await message.answer(
-        f"✅ Yil: {year}\n\n"
-        "📝 Endi anime haqida tavsif yuboring:"
-    )
+    await prompt_anime_step(message, state, 5)
 
 
 # Anime tavsifini qabul qilish va bazaga saqlash
@@ -630,15 +662,13 @@ async def receive_anime_description(message: Message, state: FSMContext):
     description = (message.text or "").strip()
     if description == "/skip":
         await state.update_data(description=None)
-        await state.set_state(content.ContentForm.poster)
-        await message.answer("Poster rasmini yuboring yoki /skip yuboring.")
+        await prompt_anime_step(message, state, 6)
         return
     if not description or len(description) > 2500:
         await message.answer("Tavsifni 1–2500 belgi oralig‘ida kiriting.")
         return
     await state.update_data(description=description)
-    await state.set_state(content.ContentForm.poster)
-    await message.answer("Posterni rasm shaklida yuboring yoki /skip yozing.")
+    await prompt_anime_step(message, state, 6)
 
 
 def admin_anime_keyboard(action):
@@ -797,13 +827,14 @@ async def admin_start_upload(
         return
 
     season_id = int(callback.data.split("_")[-1])
-    season = get_season_by_id(season_id)
+    season = await asyncio.to_thread(get_season_by_id, season_id)
 
     if not season:
         await callback.answer("Fasl topilmadi!", show_alert=True)
         return
 
-    await state.update_data(season_id=season_id)
+    await state.set_data({"season_id": season_id, "upload_title": season["anime_title"],
+                          "upload_season": season["season_number"], "upload_saved": 0, "upload_errors": 0})
     await state.set_state(UploadEpisodes.videos)
 
     await callback.message.answer(
@@ -824,7 +855,7 @@ async def admin_finish_upload(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
     data = await state.get_data()
-    season = get_season_by_id(data["season_id"])
+    season = await asyncio.to_thread(get_season_by_id, data["season_id"])
     await state.clear()
     markup = content.admin_menu(include_activity=activity.enabled() and activity.private(message, message.from_user.id))
     if season:
@@ -834,7 +865,11 @@ async def admin_finish_upload(message: Message, state: FSMContext):
             (("E’lonni ko‘rib chiqish", f"p_admin_post_{anime_id}"),),
             (("⬅️ Admin panel", "p_admin_home"),),
         )
-    await message.answer("Video yuklash yakunlandi.", reply_markup=markup)
+    await message.answer(
+        f"Video yuklash yakunlandi.\n✅ Saqlangan qismlar: {data.get('upload_saved', 0)}"
+        f"\n⚠️ Saqlanmagan videolar: {data.get('upload_errors', 0)}",
+        reply_markup=markup,
+    )
 
 
 # Admin yuborgan videoni qabul qilish
@@ -846,39 +881,44 @@ async def admin_receive_video(message: Message, state: FSMContext):
     data = await state.get_data()
     season_id = data["season_id"]
 
-    season = get_season_by_id(season_id)
-
-    if not season:
-        await message.answer("❌ Fasl topilmadi.")
-        await state.clear()
-        return
-
     media, media_type = content.pick_media(message)
     if not media:
         await message.answer("Video yoki video hujjatini yuboring.")
         return
 
+    clock = asyncio.get_running_loop().time
+    started = clock()
     try:
-        episode_number = add_episode_auto(
+        episode_number = await asyncio.to_thread(
+            add_episode_auto,
             season_id,
             media.file_id, media_type, media.file_unique_id
         )
+        if episode_number is None:
+            await state.clear()
+            await message.answer("❌ Fasl topilmadi.")
+            return
     except db.INTEGRITY_ERRORS:
+        await state.update_data(upload_errors=data.get("upload_errors", 0) + 1)
         await message.answer("Bu video ushbu faslda allaqachon mavjud.")
         return
     except db.DATABASE_ERRORS:
-        log.warning("Qismni saqlashda SQLite xatosi.")
+        await state.update_data(upload_errors=data.get("upload_errors", 0) + 1)
+        log.warning("Qismni saqlashda baza xatosi.")
         await message.answer("❌ Videoni saqlab bo'lmadi.")
         return
+    stored = clock()
+    await state.update_data(upload_saved=data.get("upload_saved", 0) + 1)
 
     await message.answer(
         "✅ Video saqlandi!\n\n"
-        f"🎬 {season['anime_title']}\n"
-        f"📺 {season['season_number']}-fasl\n"
+        f"🎬 {data['upload_title']}\n"
+        f"📺 {data['upload_season']}-fasl\n"
         f"▶️ {episode_number}-qism\n\n"
         "📤 Keyingi videoni yuborishingiz mumkin.\n"
         "🏁 Tugatish: /finish"
     )
+    log.info("Qism yuklash: baza %.1f ms, javob %.1f ms", (stored - started) * 1000, (clock() - stored) * 1000)
 
 
 # Noto'g'ri format yuborilsa
@@ -940,43 +980,50 @@ async def choose_parts_season(callback: CallbackQuery, bot: Bot):
 
 
 # 2. Raqamli qismlar - faqat videosi bor qismlar
-@dp.callback_query(F.data.regexp(r"^numbered_parts_[0-9]{1,18}$"))
+@dp.callback_query(F.data.regexp(r"^numbered_parts_[0-9]{1,18}(?:_[0-9]{1,6})?$"))
 async def numbered_parts(callback: CallbackQuery, bot: Bot):
+    clock = asyncio.get_running_loop().time
+    started = clock()
     if not await is_subscribed(bot, callback.from_user.id):
         await callback.answer("Avval kanalga obuna bo'ling!", show_alert=True)
         return
 
-    season_id = int(callback.data.split("_")[-1])
-    season = get_season_by_id(season_id)
+    _, _, raw_season, *raw_page = callback.data.split("_")
+    season_id = int(raw_season)
+    page = int(raw_page[0]) if raw_page else 0
+    season = await asyncio.to_thread(get_season_by_id, season_id)
 
-    item = store.anime_content(season["anime_id"]) if season else None
+    item = await asyncio.to_thread(store.anime_content, season["anime_id"]) if season else None
     if not item or not item["visible"]:
         await callback.answer("Fasl topilmadi!", show_alert=True)
         return
 
-    episodes = get_season_episodes(season_id)
-
-    available = sorted(
-        [ep for ep in episodes if ep["video_file_id"]],
-        key=lambda ep: ep["episode_number"]
-    )
-
-    keyboard = content.MenuKeyboardBuilder()
-
-    for episode in available:
-        keyboard.add(content.button(
-            text=str(episode["episode_number"]),
-            callback_data=f"watchpart_{episode['id']}"
-        ))
-
-    keyboard.adjust(4)
-
-    keyboard.row(
-        content.button(
-            text="⬅️ Fasllarga qaytish",
-            callback_data=f"choose_parts_{season['anime_id']}"
-        )
-    )
+    page_size = 40
+    available = await asyncio.to_thread(store.season_layout, season["anime_id"], season_id,
+                                        offset=page * page_size, limit=page_size + 1)
+    rows = []
+    episode_row = []
+    for entry in available[:page_size]:
+        if entry["kind"] == "episode":
+            episode_row.append(content.button(text=str(entry["number"]), callback_data=f"watchpart_{entry['id']}"))
+            if len(episode_row) == 4:
+                rows.append(episode_row)
+                episode_row = []
+            continue
+        if episode_row:
+            rows.append(episode_row)
+            episode_row = []
+        rows.append([content.layout_button(entry, 0)])
+    if episode_row:
+        rows.append(episode_row)
+    navigation = []
+    if page:
+        navigation.append(content.button(text="⬅️ Oldingi", callback_data=f"numbered_parts_{season_id}_{page - 1}"))
+    if len(available) > page_size:
+        navigation.append(content.button(text="➡️ Keyingi", callback_data=f"numbered_parts_{season_id}_{page + 1}"))
+    if navigation:
+        rows.append(navigation)
+    rows.append([content.button(text="⬅️ Fasllarga qaytish", callback_data=f"choose_parts_{season['anime_id']}")])
 
     message_text = (
         f"🎬 {season['anime_title']}\n"
@@ -990,9 +1037,10 @@ async def numbered_parts(callback: CallbackQuery, bot: Bot):
 
     await content.edit_text(callback.message,
         message_text,
-        reply_markup=keyboard.as_markup()
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
     )
     await callback.answer()
+    log.info("Fasl menyusi: %.1f ms", (clock() - started) * 1000)
     await activity.observe_callback(callback, "season", "season", season_id)
 
 
@@ -1172,6 +1220,15 @@ def anime_manage_keyboard(anime_id):
 
     keyboard.row(content.button(text="📺 Fasllarni boshqarish", callback_data=f"manage_seasons_{anime_id}"))
     keyboard.row(
+        content.button(text="▶️ Qismlarni boshqarish", callback_data=f"v5_partseasons_{anime_id}"),
+        content.button(text="🎬 Film va OVA", callback_data=f"x_manageanime_{anime_id}_0"),
+    )
+    keyboard.row(
+        content.button(text="🔒 Yopish", callback_data=f"v5_visibility_0_{anime_id}", style="danger"),
+        content.button(text="🔓 Ochish", callback_data=f"v5_visibility_1_{anime_id}", style="success"),
+    )
+    keyboard.row(content.button(text="↕️ Tartibni o‘zgartirish", callback_data=f"v5_layout_{anime_id}_0_0"))
+    keyboard.row(
         content.button(text="🖼 Poster", callback_data=f"p_admin_poster_{anime_id}"),
         content.button(text="📢 E’lon", callback_data=f"p_admin_post_{anime_id}"),
     )
@@ -1236,11 +1293,99 @@ async def manage_anime_detail(callback: CallbackQuery):
         await callback.answer("Anime topilmadi!", show_alert=True)
         return
 
+    announcement = await asyncio.to_thread(store.announcement, anime_id)
+    status = "Ochiq" if anime["visible"] else "Yopiq"
+    published = "Joylangan" if announcement and announcement["status"] == "sent" else "Joylanmagan"
+    poster = "Bor" if anime["poster_file_id"] else "Yo‘q"
     await content.show_content(
-        callback.message, anime, content.caption(anime), anime_manage_keyboard(anime_id), replace=True
+        callback.message, anime, content.caption(anime, admin_status=(
+            ("🔒", "Holati", status), ("📢", "Kanal", published), ("🖼", "Poster", poster),
+        )), anime_manage_keyboard(anime_id), replace=True,
     )
 
     await callback.answer()
+
+
+@dp.callback_query(F.data.regexp(r"^v5_visibility_[01]_[0-9]{1,18}$"))
+async def change_anime_visibility(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID or not isinstance(callback.message, Message):
+        await callback.answer("Ruxsat yo‘q.", show_alert=True)
+        return
+    _, _, visible, anime_id = callback.data.split("_")
+    changed = await asyncio.to_thread(store.set_visibility, int(anime_id), int(visible))
+    await callback.answer("Holat saqlandi." if changed else "Anime topilmadi.")
+    if changed:
+        await callback.message.answer(
+            "Anime ochildi." if visible == "1" else "Anime yopildi.",
+            reply_markup=content.buttons((("Anime boshqaruvi", f"manage_anime_{anime_id}"),)),
+        )
+
+
+@dp.callback_query(F.data.regexp(r"^v5_partseasons_[0-9]{1,18}$"))
+async def manage_episode_seasons(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID or not isinstance(callback.message, Message):
+        await callback.answer("Ruxsat yo‘q.", show_alert=True)
+        return
+    anime_id = int(callback.data.rsplit("_", 1)[1])
+    seasons = await asyncio.to_thread(get_anime_seasons, anime_id)
+    rows = [((f"📺 {season['season_number']}-fasl", f"manage_episodes_{season['id']}"),) for season in seasons]
+    rows.append((("📤 Video yuklash", f"p_admin_upload_{anime_id}"),))
+    rows.append((("⬅️ Orqaga", f"manage_anime_{anime_id}"),))
+    await callback.answer()
+    await content.edit_text(callback.message, "Qismlarni boshqarish", reply_markup=content.buttons(*rows))
+
+
+async def show_layout_editor(message, anime_id, season_id, page):
+    items = await asyncio.to_thread(store.season_layout, anime_id, season_id or None, offset=page * 8, limit=9)
+    rows = []
+    labels = {"season": "📺 Fasl", "episode": "▶️ Qism", "film": "🎬 Film", "ova": "⭐ OVA"}
+    for item in items[:8]:
+        kind, item_id = item["kind"], item["id"]
+        label = f"{labels[kind]} {item['number']}"
+        if kind in ("film", "ova"):
+            label += f" · {content.limited(item['title'], 30)}"
+            target = f"x_editvideo_{item_id}"
+        elif kind == "season":
+            target = f"v5_layout_{anime_id}_{item_id}_0"
+        else:
+            target = f"manage_episode_{item_id}"
+        base = f"vs_{anime_id}_{season_id}_{kind[0]}_{item_id}"
+        rows.append(((label, target), ("⬆️", f"{base}_u"), ("⬇️", f"{base}_d")))
+    if page:
+        rows.append((("⬅️ Oldingi", f"v5_layout_{anime_id}_{season_id}_{page - 1}"),))
+    if len(items) > 8:
+        rows.append((("Keyingi ➡️", f"v5_layout_{anime_id}_{season_id}_{page + 1}"),))
+    back = f"v5_layout_{anime_id}_0_0" if season_id else f"manage_anime_{anime_id}"
+    rows.append((("⬅️ Orqaga", back),))
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [content.button(text=label, callback_data=target) for label, target in row] for row in rows
+    ])
+    await content.edit_text(message, "↕️ Kontent tartibi", reply_markup=keyboard)
+
+
+@dp.callback_query(F.data.regexp(r"^v5_layout_[0-9]{1,18}_[0-9]{1,18}_[0-9]{1,6}$"))
+async def manage_layout(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID or not isinstance(callback.message, Message):
+        await callback.answer("Ruxsat yo‘q.", show_alert=True)
+        return
+    anime_id, season_id, page = map(int, callback.data.split("_")[2:])
+    await callback.answer()
+    await show_layout_editor(callback.message, anime_id, season_id, page)
+
+
+@dp.callback_query(F.data.regexp(r"^vs_[0-9]{1,18}_[0-9]{1,18}_[sefo]_[0-9]{1,18}_[ud]$"))
+async def move_layout_item(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID or not isinstance(callback.message, Message):
+        await callback.answer("Ruxsat yo‘q.", show_alert=True)
+        return
+    _, anime_id, season_id, kind, item_id, direction = callback.data.split("_")
+    anime_id, season_id, item_id = int(anime_id), int(season_id), int(item_id)
+    kinds = {"s": "season", "e": "episode", "f": "film", "o": "ova"}
+    changed = await asyncio.to_thread(store.reorder_layout, anime_id, season_id or None,
+                                      kinds[kind], item_id, -1 if direction == "u" else 1)
+    await callback.answer("Tartib saqlandi." if changed else "Bu tomonga ko‘chirib bo‘lmaydi.")
+    if changed:
+        await show_layout_editor(callback.message, anime_id, season_id, 0)
 
 
 # Tahrirlash maydonini tanlash

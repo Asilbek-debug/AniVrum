@@ -267,33 +267,25 @@ def add_episode_auto(season_id, video_file_id, media_type='video', file_unique_i
         cursor = conn.cursor()
 
         lock_writes(conn, "episodes")
-        if cursor.execute(
-            "SELECT 1 FROM episodes WHERE season_id=? AND video_file_id=?",
-            (season_id, video_file_id),
-        ).fetchone():
-            raise sqlite3.IntegrityError("Qism videosi takrorlangan.")
-
-        cursor.execute("""
-            SELECT COALESCE(MAX(episode_number), 0) + 1
-            FROM episodes
-            WHERE season_id = ?
-        """, (season_id,))
-
-        next_number = cursor.fetchone()[0]
-
-        cursor.execute("""
+        inserted = cursor.execute("""
+            WITH next_episode AS (
+                SELECT COALESCE(MAX(episode_number), 0) + 1 AS number
+                FROM episodes WHERE season_id=?
+            )
             INSERT INTO episodes
             (season_id, episode_number, title, video_file_id, media_type, file_unique_id)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (
-            season_id,
-            next_number,
-            f"{next_number}-qism",
-            video_file_id, media_type, file_unique_id
-        ))
-
-        conn.commit()
-        return next_number
+            SELECT s.id, n.number, n.number || '-qism', ?, ?, ?
+            FROM seasons s CROSS JOIN next_episode n
+            WHERE s.id=? AND NOT EXISTS (
+                SELECT 1 FROM episodes e WHERE e.season_id=s.id AND e.video_file_id=?
+            )
+            RETURNING episode_number
+        """, (season_id, video_file_id, media_type, file_unique_id, season_id, video_file_id)).fetchone()
+        if inserted:
+            return inserted[0]
+        if cursor.execute("SELECT 1 FROM seasons WHERE id=?", (season_id,)).fetchone():
+            raise sqlite3.IntegrityError("Qism videosi takrorlangan.")
+        return None
 
 
 # ==========================================
@@ -426,7 +418,8 @@ def update_season_number(season_id, new_number):
 def delete_season(season_id):
     with connection() as conn:
         cursor = conn.cursor()
-        lock_writes(conn, "episodes", "seasons")
+        lock_writes(conn, "episodes", "seasons", "standalone_videos")
+        cursor.execute("UPDATE standalone_videos SET season_id=NULL, sort_order=NULL WHERE season_id=?", (season_id,))
 
         cursor.execute(
             "DELETE FROM episodes WHERE season_id = ?",

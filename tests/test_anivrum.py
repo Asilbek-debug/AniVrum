@@ -255,7 +255,7 @@ class AniVrumTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(styles(main.main_keyboard())["anime_search"], "primary")
         self.assertIsNone(styles(main.main_keyboard())["about"])
         self.assertEqual(styles(main.anime_keyboard())["anime_az"], "primary")
-        self.assertEqual(styles(content.admin_menu())["admin_add_anime"], "success")
+        self.assertEqual(styles(content.buttons(*content.ADMIN_GROUPS["catalog"][1]))["admin_add_anime"], "success")
         self.assertEqual(styles(main.anime_manage_keyboard(23))["manage_delete_23"], "danger")
         self.assertEqual(styles(main.anime_manage_keyboard(23))["p_admin_list_manage_0"], None)
         self.assertEqual(styles(content.buttons((("✅ O‘chirish", "x_confirmvideo_7"),)))["x_confirmvideo_7"],
@@ -265,7 +265,7 @@ class AniVrumTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(styles(content.buttons((("📥 Yuklash", "downloadall_23"),)))["downloadall_23"],
                          "primary")
         link = content.channel_keyboard({"id": 23}).inline_keyboard[0][0]
-        self.assertEqual((link.style, link.url), ("primary", "https://t.me/AniVrum_bot?start=animeid_23"))
+        self.assertEqual((link.style, link.url), ("success", "https://t.me/AniVrum_bot?start=animeid_23"))
 
     def test_keyboard_rows_keep_colors_actions_and_navigation_separate(self):
         neutral = content.button(text="Bot haqida", callback_data="about")
@@ -328,9 +328,11 @@ class AniVrumTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(message.parse_mode, "HTML")
             self.assertIn(
                 "🌍 <b>Davlat:</b> Yaponiya, Xitoy\n"
-                "📺 <b>Fasllar:</b> 1 ta\n🎞 <b>Qismlar:</b> 1 ta\n"
-                "🔢 <b>Kod:</b> 3045", message.caption,
+                "📺 <b>Fasllar:</b> 1 ta\n🎞 <b>Qismlar:</b> 1 ta", message.caption,
             )
+            self.assertIn("🔢 <b>Kod:</b> 3045", message.caption)
+        for message in (admin, preview):
+            self.assertIn("🎞 <b>Filmlar:</b> 0 ta\n⭐ <b>OVA:</b> 0 ta", message.caption)
 
         await self.update(100, data="p_admin_askupdate_45")
         self.assertFalse(any(isinstance(call, (EditMessageCaption, EditMessageMedia))
@@ -350,7 +352,7 @@ class AniVrumTests(unittest.IsolatedAsyncioTestCase):
             (download,) = row
             self.assertEqual(download.text, "📥 YUKLAB OLISH")
             self.assertEqual(download.url, "https://t.me/AniVrum_bot?start=animeid_45")
-            self.assertEqual(edit.reply_markup.inline_keyboard[1][0].text, "1-fasl")
+            self.assertEqual(len(edit.reply_markup.inline_keyboard), 1)
         self.assertFalse(self.channel_posts())
 
     async def test_startup_without_real_polling(self):
@@ -461,7 +463,7 @@ class AniVrumTests(unittest.IsolatedAsyncioTestCase):
 
         await self.update(100, text="/admin")
         menu = self.session.calls[-1].reply_markup.inline_keyboard
-        manage = next(button for row in menu for button in row if "Kontent" in button.text)
+        manage = next(button for row in menu for button in row if "Animelar katalogi" in button.text)
         await self.update(100, data=manage.callback_data)
         listing = self.session.calls[-1].reply_markup.inline_keyboard
         selected = next(button for row in listing for button in row if "Yengilmas" in button.text)
@@ -929,10 +931,10 @@ class AniVrumTests(unittest.IsolatedAsyncioTestCase):
                     and call.chat_id == main.CHANNEL)
         with_links = [(row[0].text, row[0].url.split("?start=")[1])
                       for row in post.reply_markup.inline_keyboard]
-        self.assertEqual(with_links[1:], [
-            ("1-fasl", f"season_{season}"), ("Film — Birinchi film", f"extra_{film}"),
-            ("OVA — Maxsus qism", f"extra_{ova}"),
-        ])
+        self.assertEqual(with_links, [("📥 YUKLAB OLISH", f"animeid_{anime}")])
+        await self.update(11, text=f"/start animeid_{anime}")
+        actions = {button.callback_data for row in self.session.calls[-1].reply_markup.inline_keyboard for button in row}
+        self.assertTrue({f"numbered_parts_{season}", f"x_video_{film}", f"x_video_{ova}"} <= actions)
         await self.update(11, text=f"/start season_{season}")
         await self.finish_downloads()
         self.assertEqual(self.delivered(11)[-1][0], "v1")
@@ -956,11 +958,13 @@ class AniVrumTests(unittest.IsolatedAsyncioTestCase):
         film = catalog.save_video(anime, "film", 1, "Film", None, "film-file", "video")
         with patch.object(content, "ANNOUNCEMENT_PAGE_SIZE", 1):
             buttons = content.channel_keyboard({"id": anime}).inline_keyboard
-            self.assertTrue(buttons[-1][0].url.endswith(f"catalog_{anime}"))
+            self.assertEqual(len(buttons), 1)
+            self.assertTrue(buttons[0][0].url.endswith(f"animeid_{anime}"))
             await self.update(11, text=f"/start catalog_{anime}")
             next_page = self.session.calls[-1].reply_markup.inline_keyboard[-1][0]
             await self.update(11, data=next_page.callback_data)
-            self.assertTrue(self.session.calls[-1].reply_markup.inline_keyboard[0][0].url.endswith(f"extra_{film}"))
+            self.assertEqual(self.session.calls[-1].reply_markup.inline_keyboard[0][0].callback_data,
+                             f"x_video_{film}")
 
     async def test_season_order_caption_and_summary_after_last_video(self):
         self.migrate()
@@ -1072,11 +1076,68 @@ class AniVrumTests(unittest.IsolatedAsyncioTestCase):
             conn.execute("""INSERT INTO anime_views(anime_id,user_id,episode_id,season_id,viewed_at)
                 VALUES (?,11,1,?,'2000-01-01')""", (anime, season))
         with patch.dict(os.environ, {"STATISTICS_RETENTION_DAYS": "7"}):
+            catalog.prune_statistics()
             users, metrics, _, _ = catalog.owner_statistics()
         self.assertEqual(tuple(users), (0, 0))
         self.assertNotIn("search", metrics)
         self.assertEqual(catalog.content(anime)["views"], 0)
 
+
+    async def test_optional_anime_fields_and_admin_catalog_search(self):
+        self.migrate()
+        await self.update(100, data="admin_add_anime")
+        await self.update(100, text="Yangi Anime")
+        await self.update(100, text="54321")
+        await self.update(100, data="v5_anime_skip_2")
+        await self.update(100, data="v5_anime_back_3")
+        await self.update(100, text="/skip")
+        for step in (3, 4, 5, 6):
+            await self.update(100, data=f"v5_anime_skip_{step}")
+        await self.update(100, text="1")
+        with db.connection() as conn:
+            anime_id, genre, country, year, description = conn.execute(
+                "SELECT id,genre,country,release_year,description FROM animes WHERE code='54321'").fetchone()
+        self.assertEqual((genre, country, year, description), (None, None, None, None))
+        await self.update(100, data="p_admin_catalogsearch")
+        await self.update(100, text="54321")
+        actions = [button.callback_data for row in self.session.calls[-1].reply_markup.inline_keyboard for button in row]
+        self.assertIn(f"manage_anime_{anime_id}", actions)
+
+    async def test_nested_ova_reorder_and_move(self):
+        self.migrate()
+        anime, season = self.seed_season(2)
+        video = {"file_id": "ova-123", "file_unique_id": "unique-ova", "width": 1, "height": 1, "duration": 1}
+        await self.update(100, data=f"x_add_ova_{anime}")
+        await self.update(100, text="1")
+        await self.update(100, text="Maxsus qism")
+        for _ in range(6):
+            await self.update(100, text="/skip")
+        await self.update(100, video=video)
+        await self.update(100, data="xv_save_9")
+        extra, = catalog.standalone_videos(anime)
+        self.assertEqual((extra["season_id"], extra["file_id"]), (season, "ova-123"))
+        await self.update(100, data=f"vs_{anime}_{season}_o_{extra['id']}_u")
+        self.assertEqual([row["kind"] for row in catalog.season_layout(anime, season)], ["episode", "ova", "episode"])
+        await self.update(100, data=f"x_movevideo_{extra['id']}")
+        await self.update(100, data="xv_skip_0")
+        await self.update(100, data=f"vs_{anime}_0_o_{extra['id']}_u")
+        self.assertEqual([row["kind"] for row in catalog.announcement_entries(anime, 0, 10)], ["ova", "season"])
+        self.assertEqual(catalog.standalone_video(extra["id"])["file_id"], "ova-123")
+
+    async def test_channel_text_post_can_add_poster_without_changing_id(self):
+        self.migrate()
+        anime, _ = self.seed_season(1)
+        catalog.update_media(anime, "poster", None)
+        self.assertEqual(await content.publish(self.bot, main.CHANNEL, anime), "sent")
+        before = catalog.announcement(anime)
+        self.assertTrue(before["is_text"])
+        catalog.update_media(anime, "poster", "new-poster")
+        await self.update(100, data=f"p_admin_update_{anime}")
+        media_edit = next(call for call in reversed(self.session.calls) if isinstance(call, EditMessageMedia))
+        self.assertEqual((media_edit.message_id, media_edit.media.media), (before["message_id"], "new-poster"))
+        after = catalog.announcement(anime)
+        self.assertFalse(after["is_text"])
+        self.assertEqual(after["message_id"], before["message_id"])
 
     async def test_standalone_creation_edit_deletion_and_catalog(self):
         self.migrate()
@@ -1089,9 +1150,13 @@ class AniVrumTests(unittest.IsolatedAsyncioTestCase):
             with db.connection() as conn:
                 anime = conn.execute("SELECT id FROM animes WHERE code=?", (code,)).fetchone()[0]
             await self.update(100, data=f"x_add_{kind}_{anime}")
-            await self.update(100, text=f"1\nMustaqil {kind}")
-            await self.update(100, text="/skip")
+            await self.update(100, data="xv_skip_0")
+            await self.update(100, text=f"Mustaqil {kind}")
+            for _ in range(6):
+                await self.update(100, text="/skip")
             await self.update(100, video=video)
+            self.assertEqual(catalog.standalone_videos(anime), [])
+            await self.update(100, data="xv_save_9")
             entry, = catalog.standalone_videos(anime)
             self.assertEqual(await content.publish(self.bot, main.CHANNEL, anime), "sent")
             self.assertTrue(catalog.announcement(anime)["is_text"])
@@ -1115,9 +1180,10 @@ class AniVrumTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(f"download_seasons_{anime}", actions)
         self.assertEqual(sum(action.startswith("x_video_") for action in actions), 4)
         await self.update(100, data=f"x_editvideo_{entry['id']}")
-        await self.update(100, text="3\nYangi nom\nTavsif")
-        await self.update(100, text="2025\nYaponiya\nSarguzasht")
+        for value in ("Yangi nom", "3", "Sarguzasht", "Yaponiya", "2025", "Tavsif", "/skip"):
+            await self.update(100, text=value)
         await self.update(100, video={**video, "file_id": "replacement"})
+        await self.update(100, data="xv_save_9")
         updated = catalog.standalone_video(entry["id"])
         self.assertEqual((updated["number"], updated["title"], updated["file_id"], updated["release_year"]),
                          (3, "Yangi nom", "replacement", 2025))
@@ -1172,7 +1238,7 @@ class AniVrumTests(unittest.IsolatedAsyncioTestCase):
         catalog.metric("search")
         catalog.metric("error")
         await self.update(100, data="x_stats")
-        for value in ("Jami foydalanuvchilar: 2", "Qidiruvlar: 1", "Xatolar: 1"):
+        for value in ("Hisobda saqlangan foydalanuvchilar: 2", "Qidiruvlar: 1", "Qayd etilgan xatolar: 1"):
             self.assertIn(value, self.session.calls[-1].text)
 
 
